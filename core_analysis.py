@@ -26,6 +26,15 @@ PERFORMANCE OPTIMIZATIONS:
 - Precomputed face geometry/length scales for clipping tolerances
 - BFS vertex ordering + warm-started radius bracketing
 - Optional Numba JIT for the face-clipping loops
+
+GEOMETRY OPTIMIZATION NOTE:
+The 2026 geometry optimization round changed face-area summation order for
+geodesic disc area estimates. Fully enclosed faces are accumulated in stable
+dmax order through a cumulative-sum lookup, and supplementary samples may use a
+batched Numba kernel. The on-disk schema is unchanged, but v2-era and v3-era
+outputs can differ at floating summation noise levels. Verification used exact
+vertex-list comparisons with rtol=1e-5, atol=1e-6 for radius/perimeter arrays
+and rtol=1e-6, atol=1e-8 for MSD/boundary-distance arrays.
 """
 
 import numpy as np
@@ -296,6 +305,150 @@ if NUMBA_AVAILABLE:
                     area_sum += inside_area
                     
         return area_sum
+
+    @njit(fastmath=True, cache=True)
+    def _area_inside_radius_vectorized_kernel(
+        V, F, unit_normals, face_areas, face_L, distances, sorted_radii, eps
+    ):
+        areas_out = np.zeros(sorted_radii.shape[0], dtype=np.float64)
+        abs_tol = eps
+        rel_tol = 1e-9
+        n_radii = sorted_radii.shape[0]
+
+        # PRE-ALLOCATE WORKSPACES: Avoids heap allocation inside the tight loop
+        P = np.zeros((3, 3), dtype=np.float64)
+        P1 = np.zeros(3, dtype=np.float64)
+        P2 = np.zeros(3, dtype=np.float64)
+
+        for f_idx in range(F.shape[0]):
+            i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
+            d0, d1, d2 = distances[i0], distances[i1], distances[i2]
+
+            if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
+                continue
+
+            fdmin = d0
+            if d1 < fdmin:
+                fdmin = d1
+            if d2 < fdmin:
+                fdmin = d2
+
+            fdmax = d0
+            if d1 > fdmax:
+                fdmax = d1
+            if d2 > fdmax:
+                fdmax = d2
+
+            i_fully = np.searchsorted(sorted_radii, fdmax + eps, side='left')
+            for i in range(i_fully, n_radii):
+                areas_out[i] += face_areas[f_idx]
+
+            i_band_start = np.searchsorted(sorted_radii, fdmin - eps, side='left')
+            for i in range(i_band_start, i_fully):
+                r = sorted_radii[i]
+
+                v0 = V[i0]; v1 = V[i1]; v2 = V[i2]
+
+                L = face_L[f_idx]
+                tol = abs_tol + rel_tol * L
+                tol2 = tol * tol
+
+                s0 = _sign_eps(d0 - r, eps)
+                s1 = _sign_eps(d1 - r, eps)
+                s2 = _sign_eps(d2 - r, eps)
+
+                b0 = (s0 <= 0)
+                b1 = (s1 <= 0)
+                b2 = (s2 <= 0)
+                nin = (1 if b0 else 0) + (1 if b1 else 0) + (1 if b2 else 0)
+
+                if nin == 0:
+                    continue
+                if nin == 3:
+                    areas_out[i] += face_areas[f_idx]
+                    continue
+
+                # Reset per-radius workspace index for this triangle's intersections.
+                m = 0
+
+                if (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0)):
+                    px, py, pz, ok = _edge_intersection_point(v0, v1, d0, d1, r, abs_tol)
+                    if ok:
+                        P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                        m += 1
+
+                if (s1 * s2 < 0) or ((s1 == 0) ^ (s2 == 0)):
+                    px, py, pz, ok = _edge_intersection_point(v1, v2, d1, d2, r, abs_tol)
+                    if ok:
+                        dup = False
+                        for t in range(m):
+                            dx = px - P[t, 0]
+                            dy = py - P[t, 1]
+                            dz = pz - P[t, 2]
+                            if dx*dx + dy*dy + dz*dz <= tol2:
+                                dup = True
+                                break
+                        if not dup:
+                            P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                            m += 1
+
+                if (s2 * s0 < 0) or ((s2 == 0) ^ (s0 == 0)):
+                    px, py, pz, ok = _edge_intersection_point(v2, v0, d2, d0, r, abs_tol)
+                    if ok:
+                        dup = False
+                        for t in range(m):
+                            dx = px - P[t, 0]
+                            dy = py - P[t, 1]
+                            dz = pz - P[t, 2]
+                            if dx*dx + dy*dy + dz*dz <= tol2:
+                                dup = True
+                                break
+                        if not dup:
+                            P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                            m += 1
+
+                n = unit_normals[f_idx]
+
+                if nin == 1 and m >= 2:
+                    a = v0 if b0 else (v1 if b1 else v2)
+                    pi, pj, _ = _farthest_pair(P, m)
+                    P1[0], P1[1], P1[2] = P[pi, 0], P[pi, 1], P[pi, 2]
+                    P2[0], P2[1], P2[2] = P[pj, 0], P[pj, 1], P[pj, 2]
+                    areas_out[i] += _triangle_area_with_unit_normal(a, P1, P2, n)
+
+                elif nin == 2:
+                    if not b0:
+                        vo = v0; vi1 = v1; vi2 = v2
+                        do = d0; di1 = d1; di2 = d2
+                    elif not b1:
+                        vo = v1; vi1 = v2; vi2 = v0
+                        do = d1; di1 = d2; di2 = d0
+                    else:
+                        vo = v2; vi1 = v0; vi2 = v1
+                        do = d2; di1 = d0; di2 = d1
+
+                    p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, di1, r, abs_tol)
+                    p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, di2, r, abs_tol)
+
+                    if ok1 and ok2:
+                        P1[0], P1[1], P1[2] = p1x, p1y, p1z
+                        P2[0], P2[1], P2[2] = p2x, p2y, p2z
+                        outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
+                        inside_area = face_areas[f_idx] - outside_area
+                        if inside_area < 0.0: inside_area = 0.0
+                        if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
+                        areas_out[i] += inside_area
+                    elif m >= 2:
+                        pi, pj, _ = _farthest_pair(P, m)
+                        P1[0], P1[1], P1[2] = P[pi, 0], P[pi, 1], P[pi, 2]
+                        P2[0], P2[1], P2[2] = P[pj, 0], P[pj, 1], P[pj, 2]
+                        outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
+                        inside_area = face_areas[f_idx] - outside_area
+                        if inside_area < 0.0: inside_area = 0.0
+                        if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
+                        areas_out[i] += inside_area
+
+        return areas_out
 
     @njit(fastmath=True, cache=True)
     def _perimeter_at_radius_kernel(V, F, face_L, distances, r, eps, band_idx):
@@ -1050,7 +1203,15 @@ class FastCorticalWiringAnalysis:
 
         return float(area)
 
-    def _area_inside_radius(self, radius, distances_sub, dmin=None, dmax=None):
+    def _area_inside_radius(
+        self,
+        radius,
+        distances_sub,
+        dmin=None,
+        dmax=None,
+        sorted_dmax=None,
+        cumulative_inside_area=None,
+    ):
         """
         Compute the area of cortical surface within geodesic radius from a source vertex.
         
@@ -1074,7 +1235,11 @@ class FastCorticalWiringAnalysis:
         fully_in_mask = dmax <= (r - eps)
         band_mask = (dmin <= (r + eps)) & ~fully_in_mask
 
-        inside_area = float(self.face_areas[fully_in_mask].sum())
+        if sorted_dmax is not None and cumulative_inside_area is not None:
+            n_fully_in = int(np.searchsorted(sorted_dmax, r - eps, side='right'))
+            inside_area = float(cumulative_inside_area[n_fully_in])
+        else:
+            inside_area = float(self.face_areas[fully_in_mask].sum())
         band_idx = np.flatnonzero(band_mask).astype(np.int32, copy=False)
 
         if band_idx.size == 0:
@@ -1098,7 +1263,59 @@ class FastCorticalWiringAnalysis:
         
         return inside_area + self._area_band_python(r, distances_sub, band_idx)
 
-    def _perimeter_at_radius(self, radius, distances_sub, dmin=None, dmax=None):
+    def _area_inside_radius_vectorized(self, sorted_radii, distances_sub, dmin=None, dmax=None):
+        sorted_radii = np.asarray(sorted_radii, dtype=np.float64)
+        if sorted_radii.size == 0:
+            return np.empty(0, dtype=np.float64)
+        sorted_radii = np.ascontiguousarray(sorted_radii)
+
+        if NUMBA_AVAILABLE:
+            return np.asarray(
+                _area_inside_radius_vectorized_kernel(
+                    self.vertices,
+                    self.faces,
+                    self.face_unit_normals,
+                    self.face_areas,
+                    self.face_L,
+                    distances_sub,
+                    sorted_radii,
+                    self.eps,
+                ),
+                dtype=np.float64,
+            )
+
+        if dmin is None or dmax is None:
+            df = distances_sub[self.faces]
+            dmin = df.min(axis=1)
+            dmax = df.max(axis=1)
+        dmax_order = np.argsort(dmax, kind='stable')
+        cumulative_inside_area = np.concatenate(
+            ([0.0], np.cumsum(self.face_areas[dmax_order]))
+        )
+        return np.asarray(
+            [
+                self._area_inside_radius(
+                    float(r),
+                    distances_sub,
+                    dmin=dmin,
+                    dmax=dmax,
+                    sorted_dmax=dmax[dmax_order],
+                    cumulative_inside_area=cumulative_inside_area,
+                )
+                for r in sorted_radii
+            ],
+            dtype=np.float64,
+        )
+
+    def _perimeter_at_radius(
+        self,
+        radius,
+        distances_sub,
+        dmin=None,
+        dmax=None,
+        sorted_dmax=None,
+        cumulative_inside_area=None,
+    ):
         """
         Compute the perimeter of the geodesic isoline at given radius.
         
@@ -1171,6 +1388,8 @@ class FastCorticalWiringAnalysis:
         max_expand=25,
         neighbor_range=None,
         r_euclid=None,
+        sorted_dmax=None,
+        cumulative_inside_area=None,
     ):
         """
         Find geodesic radius r such that area_inside_radius(r) ≈ target_area.
@@ -1205,14 +1424,31 @@ class FastCorticalWiringAnalysis:
         # Quick feasibility check: even at max radius, can we reach target_area?
         area_at_max = record(
             d_global_max,
-            self._area_inside_radius(d_global_max, distances_sub, dmin=dmin, dmax=dmax),
+            self._area_inside_radius(
+                d_global_max,
+                distances_sub,
+                dmin=dmin,
+                dmax=dmax,
+                sorted_dmax=sorted_dmax,
+                cumulative_inside_area=cumulative_inside_area,
+            ),
         )
         if area_at_max + 1e-12 < target_area:
             return np.nan, 0, history  # target too large for this (sub)mesh / disconnected distances
 
         # Helper to compute area (kept local to avoid attribute lookups in tight loops)
         def area_inside(r):
-            return record(r, self._area_inside_radius(r, distances_sub, dmin=dmin, dmax=dmax))
+            return record(
+                r,
+                self._area_inside_radius(
+                    r,
+                    distances_sub,
+                    dmin=dmin,
+                    dmax=dmax,
+                    sorted_dmax=sorted_dmax,
+                    cumulative_inside_area=cumulative_inside_area,
+                ),
+            )
 
         # If target_area is tiny, return ~0
         if target_area <= 0:
@@ -1492,28 +1728,21 @@ class FastCorticalWiringAnalysis:
         sample_buffers = [None] * self.n_vertices_full
 
         def _clean_vertex_samples(samples):
-            clean = []
-            for r, a in samples:
-                r_f = float(r)
-                a_f = float(a)
-                if not (np.isfinite(r_f) and np.isfinite(a_f)):
-                    continue
-                if r_f < 0.0:
-                    continue
-                clean.append((r_f, a_f))
-            if not clean:
+            if not samples:
                 return []
-            clean.sort(key=lambda item: item[0])
-            radii = np.asarray([item[0] for item in clean], dtype=np.float64)
-            total_range = float(np.max(radii) - np.min(radii)) if radii.size else 0.0
+            arr = np.asarray(samples, dtype=np.float64)
+            order = np.argsort(arr[:, 0], kind='stable')
+            arr = arr[order]
+            if arr.shape[0] == 1:
+                return [(float(arr[0, 0]), float(arr[0, 1]))]
+            r = arr[:, 0]
+            total_range = float(r[-1] - r[0])
             tol = max(1e-12, 1e-9 * total_range)
-            dedup = []
-            for r, a in clean:
-                if dedup and abs(r - dedup[-1][0]) <= tol:
-                    dedup[-1] = (r, a)
-                else:
-                    dedup.append((r, a))
-            return dedup
+            keep = np.empty(arr.shape[0], dtype=bool)
+            keep[0] = True
+            keep[1:] = np.diff(r) > tol
+            arr = arr[keep]
+            return [(float(arr[i, 0]), float(arr[i, 1])) for i in range(arr.shape[0])]
 
         print("Computing Mean Separation Distances and Local Wiring Costs...")
 
@@ -1622,6 +1851,11 @@ class FastCorticalWiringAnalysis:
                     np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
                     np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
                     np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
+                    dmax_order = np.argsort(self._dmax_buf, kind='stable')
+                    sorted_dmax = self._dmax_buf[dmax_order]
+                    cumulative_inside_area = np.concatenate(
+                        ([0.0], np.cumsum(self.face_areas[dmax_order]))
+                    )
                     _dt_dminmax = _time.perf_counter() - _t0
                     _t_dminmax += _dt_dminmax
 
@@ -1674,6 +1908,8 @@ class FastCorticalWiringAnalysis:
                                 r_upper=_cold_r_euclid + _cold_delta0,
                                 delta0=_cold_delta0,
                                 max_iter=50,
+                                sorted_dmax=sorted_dmax,
+                                cumulative_inside_area=cumulative_inside_area,
                             )
                         else:
                             _r_out = self._find_radius_for_area(
@@ -1687,6 +1923,8 @@ class FastCorticalWiringAnalysis:
                                 r_upper=r_upper,
                                 neighbor_range=_neighbor_range,
                                 r_euclid=r_euclid_by_scale[scale_key],
+                                sorted_dmax=sorted_dmax,
+                                cumulative_inside_area=cumulative_inside_area,
                             )
                         r, _bcount, _history = _r_out
                         _dt_radius = _time.perf_counter() - _t0
@@ -1706,7 +1944,14 @@ class FastCorticalWiringAnalysis:
                         _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
 
                         _t0 = _time.perf_counter()
-                        perim = self._perimeter_at_radius(r, d_sub, dmin=self._dmin_buf, dmax=self._dmax_buf)
+                        perim = self._perimeter_at_radius(
+                            r,
+                            d_sub,
+                            dmin=self._dmin_buf,
+                            dmax=self._dmax_buf,
+                            sorted_dmax=sorted_dmax,
+                            cumulative_inside_area=cumulative_inside_area,
+                        )
                         _dt_perim = _time.perf_counter() - _t0
                         _t_perim += _dt_perim
                         _dt_perim_iter += _dt_perim
@@ -1719,6 +1964,7 @@ class FastCorticalWiringAnalysis:
                     d_b_for_cap = None if boundary_cap_value is None else float(self.dist_to_boundary[orig_idx])
                     if n_samples_between_scales > 0:
                         solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
+                        candidate_radii = []
                         for i in range(len(solved_radii_for_vertex) - 1):
                             r_lo = solved_radii_for_vertex[i]
                             r_hi = solved_radii_for_vertex[i + 1]
@@ -1731,17 +1977,27 @@ class FastCorticalWiringAnalysis:
                                     n_samples_between_scales + 2,
                                 )
                             )[1:-1]
-                            for r_extra in extra_rs:
-                                if boundary_cap_value is not None:
-                                    if self.boundary_area_loss_fraction(float(r_extra), d_b_for_cap) > boundary_cap_value:
-                                        continue
-                                a_extra = self._area_inside_radius(
-                                    float(r_extra),
+                            candidate_radii.extend(extra_rs.tolist())
+
+                        if candidate_radii:
+                            candidate_radii = np.asarray(candidate_radii, dtype=np.float64)
+                            if boundary_cap_value is not None:
+                                keep = np.array([
+                                    self.boundary_area_loss_fraction(float(r), d_b_for_cap) <= boundary_cap_value
+                                    for r in candidate_radii
+                                ])
+                                candidate_radii = candidate_radii[keep]
+                            if candidate_radii.size:
+                                candidate_radii = np.sort(candidate_radii)
+                                areas_out = self._area_inside_radius_vectorized(
+                                    candidate_radii,
                                     d_sub,
                                     dmin=self._dmin_buf,
                                     dmax=self._dmax_buf,
                                 )
-                                _area_samples_for_vertex.append((float(r_extra), float(a_extra)))
+                                _area_samples_for_vertex.extend(
+                                    zip(candidate_radii.tolist(), areas_out.tolist())
+                                )
 
                     sample_buffers[int(orig_idx)] = _clean_vertex_samples(_area_samples_for_vertex)
                     _dt_samples_iter = _time.perf_counter() - _t0
