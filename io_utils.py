@@ -284,67 +284,58 @@ def save_results_csv(
     output_dir,
     csv_filename,
     cortex_mask,
-    msd,
+    msd_unweighted,
+    msd_weighted,
     radius_function,
     perimeter_function,
-    anisotropy_function,
 ):
     """Write tabular results CSV."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, csv_filename)
 
     n_vertices = int(len(cortex_mask))
-    if len(msd) != n_vertices:
-        raise ValueError("MSD array must match cortex_mask length for CSV output.")
+    if len(msd_unweighted) != n_vertices or len(msd_weighted) != n_vertices:
+        raise ValueError("MSD arrays must match cortex_mask length for CSV output.")
     if (
         not isinstance(radius_function, dict)
         or not isinstance(perimeter_function, dict)
-        or not isinstance(anisotropy_function, dict)
     ):
-        raise ValueError(
-            "radius_function, perimeter_function, and anisotropy_function must be dicts keyed by scale."
-        )
+        raise ValueError("radius_function and perimeter_function must be dicts keyed by scale.")
     keys = set(radius_function.keys())
-    if (
-        keys != set(perimeter_function.keys())
-        or keys != set(anisotropy_function.keys())
-    ):
-        raise ValueError(
-            "radius_function, perimeter_function, and anisotropy_function must share the same scale keys."
-        )
+    if keys != set(perimeter_function.keys()):
+        raise ValueError("radius_function and perimeter_function must share the same scale keys.")
 
     scale_keys = list(radius_function.keys())
     radius_arrays = {}
     perimeter_arrays = {}
-    anisotropy_arrays = {}
     for scale_key in scale_keys:
         r_arr = np.asarray(radius_function[scale_key])
         p_arr = np.asarray(perimeter_function[scale_key])
-        a_arr = np.asarray(anisotropy_function[scale_key])
         if (
             r_arr.shape[0] != n_vertices
             or p_arr.shape[0] != n_vertices
-            or a_arr.shape[0] != n_vertices
         ):
             raise ValueError("All metric arrays must match cortex_mask length for CSV output.")
         radius_arrays[scale_key] = r_arr
         perimeter_arrays[scale_key] = p_arr
-        anisotropy_arrays[scale_key] = a_arr
 
     with open(path, "w", encoding="utf-8") as f:
-        header = ["vertex_id", "is_cortex", "msd"]
+        header = ["vertex_id", "is_cortex", "msd_unweighted", "msd_weighted"]
         for scale_key in scale_keys:
             token = format(float(scale_key), "g")
             header.append(f"radius_{token}")
             header.append(f"perimeter_{token}")
-            header.append(f"anisotropy_{token}")
         f.write(",".join(header) + "\n")
         for i in range(n_vertices):
-            fields = [str(i), str(int(bool(cortex_mask[i]))), str(float(msd[i]))]
+            fields = [
+                str(i),
+                str(int(bool(cortex_mask[i]))),
+                str(float(msd_unweighted[i])),
+                str(float(msd_weighted[i])),
+            ]
             for scale_key in scale_keys:
                 fields.append(str(float(radius_arrays[scale_key][i])))
                 fields.append(str(float(perimeter_arrays[scale_key][i])))
-                fields.append(str(float(anisotropy_arrays[scale_key][i])))
             f.write(",".join(fields) + "\n")
     return path
 
@@ -433,9 +424,14 @@ def save_analysis_npz(output_dir, npz_filename, analysis, n_samples_between_scal
     payload = dict(analysis.get_metric_arrays())
     payload.update(
         {
-            "sampled_radii": np.asarray(analysis.sampled_radii, dtype=np.float32),
-            "sampled_areas": np.asarray(analysis.sampled_areas, dtype=np.float32),
-            "n_samples_per_vertex": np.asarray(analysis.n_samples_per_vertex, dtype=np.int32),
+            "fastcw_output_schema_version": np.asarray(2, dtype=np.int32),
+            "sample_storage_layout": np.asarray("csr_flat_v1"),
+            "sample_storage_note": np.asarray(
+                "sample_radii_flat/sample_areas_flat are CSR-style rows indexed by sample_indptr[v]:sample_indptr[v+1]."
+            ),
+            "sample_radii_flat": np.asarray(analysis.sample_radii_flat, dtype=np.float32),
+            "sample_areas_flat": np.asarray(analysis.sample_areas_flat, dtype=np.float32),
+            "sample_indptr": np.asarray(analysis.sample_indptr, dtype=np.int64),
             "sample_scales_solved": np.asarray(analysis.active_scales, dtype=np.float64),
             "n_samples_between_scales": np.asarray(
                 int(
@@ -461,11 +457,11 @@ def load_sampled_pairs(npz_path):
     """
     Load sampled radius/area pairs from a FastCW compressed NPZ.
 
-    Downstream refitting code should use n_samples_per_vertex[v] to slice
-    sampled_radii[v, :n] and sampled_areas[v, :n].
+    Downstream refitting code should use sample_indptr[v]:sample_indptr[v + 1]
+    to slice sample_radii_flat and sample_areas_flat.
     """
     data = np.load(npz_path, allow_pickle=False)
-    required = ("sampled_radii", "sampled_areas", "n_samples_per_vertex")
+    required = ("sample_radii_flat", "sample_areas_flat", "sample_indptr")
     missing = [key for key in required if key not in data]
     if missing:
         raise ValueError(f"NPZ file is missing sampled-pair arrays: {', '.join(missing)}")

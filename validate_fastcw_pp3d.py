@@ -599,7 +599,7 @@ def validate_surface(base_dir, subject_id, cfg, run_integration=False):
 
             target_area = cfg["area_fn"](r_true)
             p_true = cfg["perim_fn"](r_true)
-            r_measured = analysis._find_radius_for_area(
+            r_measured, _bcount, _history = analysis._find_radius_for_area(
                 d_sub,
                 target_area,
                 tol=1e-3,
@@ -670,7 +670,7 @@ def validate_surface(base_dir, subject_id, cfg, run_integration=False):
         ref_area = float(cfg["area_fn"](ref_r))
         ref_perim = float(cfg["perim_fn"](ref_r))
         scale = ref_area / float(np.sum(analysis.vertex_areas_sub))
-        analysis.compute_all_wiring_costs(compute_msd=False, scale=scale, area_tol=1e-3)
+        analysis.compute_all_wiring_costs(scale=scale, area_tol=1e-3)
         scale_key = FastCorticalWiringAnalysis.normalize_scales(scale)[0]
 
         eligible = np.ones(test_vertices.shape[0], dtype=bool)

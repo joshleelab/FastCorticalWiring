@@ -39,16 +39,14 @@ The cerebral cortex is a folded 2-dimensional sheet embedded in 3D. Many biologi
 This package computes intrinsic wiring metrics at each cortical vertex:
 
 * **Mean Separation Distance (MSD)**
-  Area-weighted mean geodesic distance to all other cortical vertices. A global measure of intrinsic wiring cost or spatial isolation.
+  Emitted as `msd_unweighted` (Ecker 2013 arithmetic mean over vertices) and
+  `msd_weighted` (area-weighted surface-integral approximation).
 
 * **Radius Function (Local Wiring Scale)**
   The geodesic radius required to enclose a fixed fraction of cortical surface area (typically 5%).
 
 * **Perimeter Function (Boundary Wiring Cost)**
   The perimeter of the geodesic disc defined by the radius function. Related to the cost of connecting to neighboring cortical territories.
-
-* **Interior-Disk Anisotropy**
-  Area-weighted covariance anisotropy of vertices inside each geodesic disk (`d <= r_scale`). By default this uses tangent-plane projection; `--compute-anisotropy` enables potpourri3d log-map coordinates.
 
 * **Distance to Boundary**
   Geodesic distance from each vertex to the nearest physical submesh boundary, useful for filtering large-radius finite-size effects.
@@ -133,7 +131,7 @@ Automatically restricts computation to cortex label:
 
 Produces both analysis-ready and visualization-ready outputs:
 
-* CSV tables with per-vertex metrics (`msd` and per-scale local measures)
+* CSV tables with per-vertex metrics (`msd_unweighted`, `msd_weighted`, and per-scale local measures)
 * FreeSurfer `.mgh` overlays
 * fsLR `.shape.gii` overlays
 * compressed `*_wiring_samples.npz` files with sampled `(radius, area)` pairs
@@ -209,8 +207,8 @@ Common options:
 --engine potpourri|batch_heat|pygeodesic|pycortex
 --batch-size 32
 --n-samples-between-scales 3
---boundary-cap-fraction 0.5
---compute-anisotropy
+--boundary-cap-fraction 0.05
+--verbose-timing
 --overwrite
 ```
 
@@ -232,8 +230,8 @@ The CLI writes scalar outputs plus a compressed sample archive named like:
 
 The NPZ contains:
 
-* `sampled_radii`, `sampled_areas`: NaN-padded `float32` arrays shaped `(n_vertices, max_samples)`
-* `n_samples_per_vertex`: row-wise valid sample counts
+* `sample_radii_flat`, `sample_areas_flat`: flat CSR-style `float32` sample arrays
+* `sample_indptr`: `int64` row offsets; vertex `v` samples are `flat[indptr[v]:indptr[v+1]]`
 * `sample_scales_solved`, `n_samples_between_scales`, `boundary_cap_fraction`
 * `cortex_mask`, `sub_to_orig`
 
@@ -285,7 +283,7 @@ Typical performance on fsaverage6 (~41k vertices):
 
 Performance scales approximately linearly with number of vertices.
 
-The radius phase uses vectorized fully-inside triangle accumulation and band-only clipping around isolines. `--n-samples-between-scales` adds a small amount of area-integration work after the scale radii have been solved. `--boundary-cap-fraction` filters only supplementary samples near mesh boundaries; converged target-scale samples are always retained. Use `--boundary-cap-fraction none` to disable this filter.
+The radius phase uses vectorized fully-inside triangle accumulation and band-only clipping around isolines. `--n-samples-between-scales` adds a small amount of area-integration work after the scale radii have been solved. `--boundary-cap-fraction` filters only supplementary samples by estimated boundary-clipped disc area loss; converged target-scale samples are always retained. The value is an area-loss fraction under a locally Euclidean, locally planar-boundary circular-segment approximation: `0.0` rejects once a supplementary disc crosses the boundary, `0.05` permits up to 5% loss, and values must be in `[0, 0.5)`. Leave it unset or use `--boundary-cap-fraction none` for no cap. This is not comparable to the old geometric radius-fraction semantics; old values should be reselected explicitly.
 
 ---
 
@@ -357,22 +355,6 @@ Represents boundary extent between cortical regions.
 Related to inter-area connection costs and cortical topology.
 
 ---
-
-### Interior-disk anisotropy
-
-Represents directional elongation of the interior geodesic neighborhood.
-
-Near 0:
-
-* isotropic local neighborhoods
-* approximately circular interior point distributions
-
-Higher values:
-
-* elongated local neighborhoods
-* directionally biased intrinsic geometry
-
-The default path uses a fast tangent-plane projection. `--compute-anisotropy` uses potpourri3d's vector heat log map when available; if log-map support is unavailable, intrinsic anisotropy values are emitted as `NaN` unless `--strict-anisotropy` is set, in which case initialization fails immediately.
 
 ## Optimization summary
 

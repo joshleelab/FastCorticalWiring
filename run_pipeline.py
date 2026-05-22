@@ -222,7 +222,6 @@ def build_fastcw_cmd(args, subject):
     if args.custom_label: cmd.extend(["--custom-label", args.custom_label])
     if args.mask: cmd.extend(["--mask", args.mask])
     if args.no_mask: cmd.append("--no-mask")
-    if args.no_compute_msd: cmd.append("--no-compute-msd")
     if args.overwrite: cmd.append("--overwrite")
     cmd.extend(["--output-label", args.output_label])
     if args.output_dir: cmd.extend(["--output-dir", args.output_dir])
@@ -236,8 +235,7 @@ def build_fastcw_cmd(args, subject):
             cmd.extend(["--sample-kind", str(args.sample_kind)])
     if args.sample_method is not None: cmd.extend(["--sample-method", args.sample_method])
     if args.vertex_list: cmd.extend(["--vertex-list", args.vertex_list])
-    if args.compute_anisotropy: cmd.append("--compute-anisotropy")
-    if args.strict_anisotropy: cmd.append("--strict-anisotropy")
+    if args.verbose_timing: cmd.append("--verbose-timing")
 
     cmd.extend([
         "--scale", *[str(s) for s in args.scale],
@@ -321,7 +319,6 @@ def main():
         help="Sampling method (defaults to stratified when sampling is enabled)",
     )
     parser.add_argument("--vertex-list", default=None, help="Subset by vertex-index list file")
-    parser.add_argument("--no-compute-msd", action="store_true", help="Disable MSD computation")
     parser.add_argument(
         "--scale",
         nargs="+",
@@ -353,22 +350,16 @@ def main():
     parser.add_argument(
         "--boundary-cap-fraction",
         type=lambda raw: None if str(raw).strip().lower() in {"none", "null", "off", "false", "disable", "disabled"} else float(raw),
-        default=0.5,
-        help="Skip supplementary samples beyond this fraction of distance-to-boundary; use 'none' to disable",
+        default=None,
+        help="Skip supplementary samples whose estimated boundary-clipped disc area fraction exceeds this value (0.05 = 5 percent area-loss tolerance); unset or 'none' disables the cap",
     )
     parser.add_argument(
-        "--compute-anisotropy",
+        "--verbose-timing",
         action="store_true",
         default=False,
-        help="Enable intrinsic log-map anisotropy in FastCW",
+        help="Emit FastCW per-vertex timing lines",
     )
-    parser.add_argument(
-        "--strict-anisotropy",
-        action="store_true",
-        default=False,
-        help="Fail if FastCW cannot initialize log-map anisotropy",
-    )
-    parser.add_argument("-j", "--jobs", type=int, default=14, help="Number of parallel processes")
+    parser.add_argument("-j", "--jobs", type=int, default=16, help="Number of parallel processes")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument("--log-dir", default="logs_fastcw", help="Directory for per-subject logs")

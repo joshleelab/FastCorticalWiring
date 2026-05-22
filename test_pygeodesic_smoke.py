@@ -75,7 +75,7 @@ class PyGeodesicBackendSmokeTests(unittest.TestCase):
             eps=1e-6,
             metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_octa"},
         )
-        analysis.compute_all_wiring_costs(compute_msd=False, scale=0.2, area_tol=0.1)
+        analysis.compute_all_wiring_costs(scale=0.2, area_tol=0.1)
 
         scale_key = FastCorticalWiringAnalysis.normalize_scales(0.2)[0]
         self.assertIn(scale_key, analysis.radius_function)

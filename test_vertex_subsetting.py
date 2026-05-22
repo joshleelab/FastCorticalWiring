@@ -10,6 +10,7 @@ import numpy as np
 
 import fastcw
 from core_analysis import FastCorticalWiringAnalysis
+from io_utils import load_sampled_pairs, save_analysis_npz
 
 
 class _DummyDistanceEngine:
@@ -44,9 +45,86 @@ class _BatchRecordingDistanceEngine(_DummyDistanceEngine):
 
 
 class VertexSubsetAnalysisTests(unittest.TestCase):
+    def test_boundary_area_loss_fraction_geometry(self):
+        loss = FastCorticalWiringAnalysis.boundary_area_loss_fraction
+        self.assertAlmostEqual(loss(10.0, 10.0), 0.0, places=12)
+        self.assertAlmostEqual(loss(10.0, 5.0), 0.19550110947788538, places=12)
+        self.assertAlmostEqual(loss(10.0, 0.0), 0.5, places=12)
+        self.assertAlmostEqual(loss(10.0, 20.0), 0.0, places=12)
+        self.assertAlmostEqual(loss(10.0, np.inf), 0.0, places=12)
+
     def test_normalize_scales_sorts_ascending(self):
         scales = FastCorticalWiringAnalysis.normalize_scales([0.05, 0.001, 0.01, 0.005])
         self.assertEqual(scales, (0.001, 0.005, 0.01, 0.05))
+
+    def _make_boundary_cap_analysis(self, boundary_sub_idx=10):
+        vertices = np.array([[float(i), float(i % 2), 0.0] for i in range(11)], dtype=np.float64)
+        faces = []
+        for i in range(9):
+            faces.append([i, i + 1, i + 2])
+        faces = np.asarray(faces, dtype=np.int32)
+        cortex_mask = np.ones(vertices.shape[0], dtype=bool)
+        with mock.patch("core_analysis.create_distance_engine", side_effect=_dummy_engine_factory):
+            analysis = FastCorticalWiringAnalysis(
+                vertices,
+                faces,
+                cortex_mask,
+                engine_type="potpourri",
+                eps=1e-6,
+                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "line_strip"},
+            )
+        analysis.boundary_indices = np.asarray([boundary_sub_idx], dtype=np.int32)
+        analysis._perimeter_at_radius = lambda *args, **kwargs: 1.0
+        analysis._area_inside_radius = lambda r, *args, **kwargs: 1000.0 + float(r)
+        return analysis
+
+    def _run_boundary_cap_case(self, radii, cap):
+        analysis = self._make_boundary_cap_analysis()
+        it = iter(float(r) for r in radii)
+
+        def fake_find_radius(_distances_sub, target_area, **_kwargs):
+            return next(it), 1, []
+
+        analysis._find_radius_for_area = fake_find_radius
+        scales = [0.01 * (i + 1) for i in range(len(radii))]
+        analysis.compute_all_wiring_costs(
+            scale=scales,
+            area_tol=0.1,
+            vertex_subset=[0],
+            n_samples_between_scales=1,
+            boundary_cap_fraction=cap,
+        )
+        sample_radii, sample_areas = analysis.get_vertex_samples(0)
+        extras = sample_radii[sample_areas > 900.0]
+        return np.asarray(extras, dtype=np.float64)
+
+    def test_boundary_cap_zero_rejects_supplementary_samples_after_crossing_boundary(self):
+        extras = self._run_boundary_cap_case([9.98, 10.0, 10.02], cap=0.0)
+        self.assertTrue(np.any(np.isclose(extras, np.sqrt(9.98 * 10.0), rtol=1e-5)))
+        self.assertFalse(np.any(np.isclose(extras, np.sqrt(10.0 * 10.02), rtol=1e-5)))
+
+    def test_boundary_cap_area_loss_tolerance_accepts_until_threshold(self):
+        extras = self._run_boundary_cap_case([14.4, 14.6, 15.1, 15.3], cap=0.1)
+        self.assertTrue(np.any(np.isclose(extras, np.sqrt(14.4 * 14.6), rtol=1e-5)))
+        self.assertFalse(np.any(np.isclose(extras, np.sqrt(15.1 * 15.3), rtol=1e-5)))
+
+    def test_boundary_cap_none_accepts_extreme_supplementary_samples(self):
+        extras = self._run_boundary_cap_case([9990.0, 10010.0], cap=None)
+        self.assertTrue(np.any(np.isclose(extras, np.sqrt(9990.0 * 10010.0), rtol=1e-5)))
+
+    def test_boundary_cap_fraction_validation(self):
+        analysis = self._make_boundary_cap_analysis()
+        analysis._find_radius_for_area = lambda *args, **kwargs: (1.0, 1, [])
+        for bad in (-0.1, 0.5, 0.7, 1.0, np.nan):
+            with self.subTest(boundary_cap_fraction=bad):
+                with self.assertRaises(ValueError):
+                    analysis.compute_all_wiring_costs(
+                        scale=[0.01, 0.02],
+                        area_tol=0.1,
+                        vertex_subset=[0],
+                        n_samples_between_scales=1,
+                        boundary_cap_fraction=bad,
+                    )
 
     def test_interior_nonmanifold_auto_enables_potpourri_robust_mode(self):
         vertices = np.array(
@@ -130,12 +208,10 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
             )
 
-        analysis._find_radius_for_area = lambda *args, **kwargs: 1.0
+        analysis._find_radius_for_area = lambda *args, **kwargs: (1.0, 1, [(1.0, 0.2)])
         analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
-        analysis._disk_anisotropy_from_vertices = lambda *args, **kwargs: 0.25
 
         analysis.compute_all_wiring_costs(
-            compute_msd=True,
             scale=0.2,
             area_tol=0.1,
             vertex_subset=[0, 2, 4, 99, -1],
@@ -143,57 +219,19 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
 
         scale_key = FastCorticalWiringAnalysis.normalize_scales(0.2)[0]
         for idx in (0, 2):
-            self.assertTrue(np.isfinite(analysis.msd[idx]))
+            self.assertTrue(np.isfinite(analysis.msd_unweighted[idx]))
+            self.assertTrue(np.isfinite(analysis.msd_weighted[idx]))
             self.assertTrue(np.isfinite(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isfinite(analysis.perimeter_function[scale_key][idx]))
-            self.assertTrue(np.isfinite(analysis.anisotropy_function[scale_key][idx]))
-            n_samples = int(analysis.n_samples_per_vertex[idx])
-            self.assertGreaterEqual(n_samples, 1)
-            self.assertTrue(np.any(np.isclose(analysis.sampled_radii[idx, :n_samples], 1.0)))
+            radii, _areas = analysis.get_vertex_samples(idx)
+            self.assertGreaterEqual(len(radii), 1)
+            self.assertTrue(np.any(np.isclose(radii, 1.0)))
 
         for idx in (1, 3, 4):
-            self.assertTrue(np.isnan(analysis.msd[idx]))
+            self.assertTrue(np.isnan(analysis.msd_unweighted[idx]))
+            self.assertTrue(np.isnan(analysis.msd_weighted[idx]))
             self.assertTrue(np.isnan(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isnan(analysis.perimeter_function[scale_key][idx]))
-            self.assertTrue(np.isnan(analysis.anisotropy_function[scale_key][idx]))
-
-    def test_requested_intrinsic_anisotropy_does_not_use_extrinsic_fallback(self):
-        vertices = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ],
-            dtype=np.float64,
-        )
-        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
-        cortex_mask = np.ones(vertices.shape[0], dtype=bool)
-
-        with mock.patch("core_analysis.create_distance_engine", side_effect=_dummy_engine_factory):
-            analysis = FastCorticalWiringAnalysis(
-                vertices,
-                faces,
-                cortex_mask,
-                engine_type="potpourri",
-                eps=1e-6,
-                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
-            )
-
-        analysis._find_radius_for_area = lambda *args, **kwargs: 1.0
-        analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
-        analysis._disk_anisotropy_from_vertices = lambda *args, **kwargs: 0.25
-
-        analysis.compute_all_wiring_costs(
-            compute_msd=True,
-            scale=0.2,
-            area_tol=0.1,
-            vertex_subset=[0],
-            compute_anisotropy=True,
-        )
-
-        scale_key = FastCorticalWiringAnalysis.normalize_scales(0.2)[0]
-        self.assertTrue(np.isnan(analysis.anisotropy_function[scale_key][0]))
 
     def test_multiscale_solving_uses_sorted_scales_and_cold_start_bounds(self):
         vertices = np.array(
@@ -225,12 +263,11 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
 
         def fake_find_radius(distances_sub, target_area, **kwargs):
             calls.append({"target_area": float(target_area), "r_lower": kwargs.get("r_lower")})
-            return float(len(calls))
+            return float(len(calls)), 1, [(float(len(calls)), float(target_area))]
 
         analysis._find_radius_for_area = fake_find_radius
 
         analysis.compute_all_wiring_costs(
-            compute_msd=False,
             scale=[0.2, 0.05, 0.1],
             area_tol=0.1,
             vertex_subset=[0],
@@ -244,6 +281,55 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
         self.assertIsNotNone(calls[2]["r_lower"])
         self.assertLess(calls[0]["r_lower"], calls[1]["r_lower"])
         self.assertLess(calls[1]["r_lower"], calls[2]["r_lower"])
+
+    def test_msd_variants_and_csr_samples_roundtrip(self):
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        cortex_mask = np.ones(vertices.shape[0], dtype=bool)
+
+        with mock.patch("core_analysis.create_distance_engine", side_effect=_dummy_engine_factory):
+            analysis = FastCorticalWiringAnalysis(
+                vertices,
+                faces,
+                cortex_mask,
+                engine_type="potpourri",
+                eps=1e-6,
+                metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
+            )
+
+        analysis.vertex_areas_sub[:] = 1.0
+        analysis._find_radius_for_area = lambda *args, **kwargs: (1.0, 1, [(0.5, 0.1), (1.0, 0.2)])
+        analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
+
+        analysis.compute_all_wiring_costs(scale=0.2, area_tol=0.1, vertex_subset=[0], n_samples_between_scales=0)
+
+        d_sub = np.abs(np.arange(analysis.n_vertices, dtype=np.float64) - 0.0)
+        valid = (d_sub > analysis.eps) & np.isfinite(d_sub)
+        expected = np.mean(d_sub[valid])
+        self.assertAlmostEqual(float(analysis.msd_unweighted[0]), float(expected), places=6)
+        self.assertAlmostEqual(float(analysis.msd_weighted[0]), float(expected), places=6)
+        self.assertEqual(int(analysis.sample_indptr[-1]), len(analysis.sample_radii_flat))
+        self.assertEqual(len(analysis.sample_radii_flat), len(analysis.sample_areas_flat))
+
+        expected_radii, expected_areas = analysis.get_vertex_samples(0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = save_analysis_npz(tmpdir, "roundtrip.npz", analysis)
+            loaded = load_sampled_pairs(path)
+            try:
+                lo = int(loaded["sample_indptr"][0])
+                hi = int(loaded["sample_indptr"][1])
+                np.testing.assert_array_equal(loaded["sample_radii_flat"][lo:hi], expected_radii)
+                np.testing.assert_array_equal(loaded["sample_areas_flat"][lo:hi], expected_areas)
+            finally:
+                loaded.close()
 
     def test_compute_all_wiring_costs_consumes_distance_batches_in_order(self):
         vertices = np.array(
@@ -274,12 +360,10 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
             )
 
-        analysis._find_radius_for_area = lambda *args, **kwargs: 1.0
+        analysis._find_radius_for_area = lambda *args, **kwargs: (1.0, 1, [(1.0, 0.2)])
         analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
-        analysis._disk_anisotropy_from_vertices = lambda *args, **kwargs: 0.25
 
         analysis.compute_all_wiring_costs(
-            compute_msd=True,
             scale=0.2,
             area_tol=0.1,
             batch_size=2,
@@ -323,7 +407,8 @@ class _StubAnalysis:
         n = int(cortex_mask.shape[0])
         self.cortex_mask_full = np.asarray(cortex_mask, dtype=bool)
         self.n_vertices_full = n
-        self.msd = np.full(n, np.nan, dtype=np.float32)
+        self.msd_unweighted = np.full(n, np.nan, dtype=np.float32)
+        self.msd_weighted = np.full(n, np.nan, dtype=np.float32)
         self.active_scales = tuple(self.DEFAULT_SCALES)
         self.radius_function = {
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
@@ -331,9 +416,9 @@ class _StubAnalysis:
         self.perimeter_function = {
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
         }
-        self.anisotropy_function = {
-            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
-        }
+        self.sample_radii_flat = np.empty(0, dtype=np.float32)
+        self.sample_areas_flat = np.empty(0, dtype=np.float32)
+        self.sample_indptr = np.zeros(n + 1, dtype=np.int64)
 
     def compute_all_wiring_costs(self, **kwargs):
         _StubAnalysis.last_compute_kwargs = dict(kwargs)
@@ -346,18 +431,14 @@ class _StubAnalysis:
         self.perimeter_function = {
             float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
         }
-        self.anisotropy_function = {
-            float(s): np.full(n, np.nan, dtype=np.float32) for s in self.active_scales
-        }
-        return self.msd, self.radius_function, self.perimeter_function
+        return (self.msd_unweighted, self.msd_weighted), self.radius_function, self.perimeter_function
 
     def get_metric_arrays(self):
-        out = {"msd": self.msd}
+        out = {"msd_unweighted": self.msd_unweighted, "msd_weighted": self.msd_weighted}
         for scale in self.active_scales:
             token = FastCorticalWiringAnalysis.scale_token(scale)
             out[f"radius_{token}"] = self.radius_function[float(scale)]
             out[f"perimeter_{token}"] = self.perimeter_function[float(scale)]
-            out[f"anisotropy_{token}"] = self.anisotropy_function[float(scale)]
         return out
 
 
@@ -401,7 +482,6 @@ class VertexListLoadingTests(unittest.TestCase):
                             output_format="csv",
                             engine_type="potpourri",
                             engine_kwargs={},
-                            compute_msd=False,
                             scale=0.05,
                             area_tol=0.01,
                             eps=1e-6,
@@ -449,12 +529,12 @@ class VertexListLoadingTests(unittest.TestCase):
 
 
 class MetricNameRegistrationTests(unittest.TestCase):
-    def test_metric_names_for_scales_include_anisotropy(self):
+    def test_metric_names_for_scales_include_dual_msd(self):
         names = fastcw._metric_names_for_scales((0.05,))
-        self.assertIn("msd", names)
+        self.assertIn("msd_unweighted", names)
+        self.assertIn("msd_weighted", names)
         self.assertIn("radius_0.05", names)
         self.assertIn("perimeter_0.05", names)
-        self.assertIn("anisotropy_0.05", names)
 
 
 class NamingSuffixTests(unittest.TestCase):

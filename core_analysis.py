@@ -9,9 +9,14 @@ with high local curvature require more "wiring" (neural connections) to connect 
 which can be quantified using geodesic distances on the cortical surface.
 
 KEY METRICS COMPUTED:
-1. Mean Separation Distance (MSD): Average geodesic distance from each vertex to all others
-2. Radius Function: Geodesic radius needed to encompass a fixed area around each vertex  
-3. Perimeter Function: Perimeter of that geodesic disc (related to wiring cost)
+1. MSD (unweighted): Arithmetic mean of geodesic distances from the source
+   vertex to all other cortical vertices. Matches Ecker et al. 2013 and is
+   sensitive to vertex resampling density.
+2. MSD (weighted): Area-weighted mean using barycentric vertex areas.
+   Approximates the surface integral 1/A integral d(x,y) dA(y) and is invariant to
+   vertex resampling.
+3. Radius Function: Geodesic radius needed to encompass a fixed area around each vertex
+4. Perimeter Function: Perimeter of that geodesic disc (related to wiring cost)
 
 PERFORMANCE OPTIMIZATIONS:
 - Engine-adapter geodesics on a cortex-only submesh
@@ -419,8 +424,6 @@ class FastCorticalWiringAnalysis:
         engine_kwargs=None,
         eps=1e-6,
         metadata=None,
-        compute_anisotropy=False,
-        strict_anisotropy=False,
         allow_interior_nonmanifold=False,
     ):
         """
@@ -434,8 +437,6 @@ class FastCorticalWiringAnalysis:
             engine_kwargs: Optional backend-specific kwargs
             eps: Numerical tolerance for geometric computations
             metadata: Optional metadata dict for provenance/naming
-            compute_anisotropy: Initialize potpourri3d vector heat log-map solver
-            strict_anisotropy: Raise if log-map anisotropy cannot be initialized
             allow_interior_nonmanifold: Continue even when interior non-manifold
                 vertices are detected in the cortical submesh.
 
@@ -455,8 +456,6 @@ class FastCorticalWiringAnalysis:
         self.surf_type = self.metadata.get("surf_type", "surface")
         self.eps = float(eps)
         self.custom_label = self.metadata.get("custom_label")
-        self.compute_anisotropy = bool(compute_anisotropy)
-        self.strict_anisotropy = bool(strict_anisotropy)
         self.allow_interior_nonmanifold = bool(allow_interior_nonmanifold)
 
         # Input mesh in original vertex space
@@ -548,11 +547,6 @@ class FastCorticalWiringAnalysis:
         self.distance_engine = create_distance_engine(self.engine_type, V, F, self.engine_kwargs)
         print(f"Geodesic backend: {self.distance_engine.name}")
 
-        self._vector_heat_solver = None
-        self._vector_heat_unavailable_reason = None
-        if self.compute_anisotropy:
-            self._initialize_vector_heat_solver(strict=self.strict_anisotropy)
-
         # Cache face columns and reusable scratch buffers for per-face distance bounds.
         self._f0 = np.ascontiguousarray(self.faces[:, 0])
         self._f1 = np.ascontiguousarray(self.faces[:, 1])
@@ -565,6 +559,7 @@ class FastCorticalWiringAnalysis:
 
         # Cache submesh adjacency and BFS traversal order for reuse across runs.
         self._adj = self._build_vertex_adjacency()
+        self._report_connected_components()
         self._bfs_order, _ = self._bfs_order_all(start=0)
         
         # Precompute face geometry for efficient area/perimeter calculations
@@ -577,7 +572,8 @@ class FastCorticalWiringAnalysis:
         self.vertex_areas[self.sub_to_orig] = self.vertex_areas_sub
         
         # Initialize result arrays (will be filled by computation methods)
-        self.msd = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
+        self.msd_unweighted = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
+        self.msd_weighted = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
         self.active_scales = tuple(self.DEFAULT_SCALES)
         self.radius_function = {
             float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
@@ -585,46 +581,12 @@ class FastCorticalWiringAnalysis:
         self.perimeter_function = {
             float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
         }
-        self.anisotropy_function = {
-            float(scale): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for scale in self.active_scales
-        }
         self.dist_to_boundary = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
-        self.sampled_radii = None
-        self.sampled_areas = None
-        self.n_samples_per_vertex = None
+        self.sample_radii_flat = None
+        self.sample_areas_flat = None
+        self.sample_indptr = None
         self.n_samples_between_scales = 0
         self.boundary_cap_fraction = None
-
-    def _initialize_vector_heat_solver(self, strict=False):
-        """Initialize potpourri3d's vector heat solver for log-map anisotropy."""
-        if self._vector_heat_solver is not None:
-            return
-        if self._vector_heat_unavailable_reason is not None and not strict:
-            return
-        try:
-            import potpourri3d as pp3d
-        except Exception as exc:
-            self._vector_heat_unavailable_reason = (
-                "potpourri3d is required for log-map anisotropy. "
-                "Install a version with MeshVectorHeatSolver.compute_log_map."
-            )
-            if strict:
-                raise ImportError(self._vector_heat_unavailable_reason) from exc
-            warnings.warn(self._vector_heat_unavailable_reason, RuntimeWarning)
-            return
-
-        solver_cls = getattr(pp3d, "MeshVectorHeatSolver", None)
-        if solver_cls is None or not hasattr(solver_cls, "compute_log_map"):
-            self._vector_heat_unavailable_reason = (
-                "Installed potpourri3d does not expose MeshVectorHeatSolver.compute_log_map; "
-                "upgrade potpourri3d to use log-map anisotropy."
-            )
-            if strict:
-                raise RuntimeError(self._vector_heat_unavailable_reason)
-            warnings.warn(self._vector_heat_unavailable_reason, RuntimeWarning)
-            return
-
-        self._vector_heat_solver = solver_cls(self.vertices, self.faces)
 
     @staticmethod
     def normalize_scales(scale):
@@ -658,6 +620,26 @@ class FastCorticalWiringAnalysis:
     def scale_token(scale):
         """Stable string token for metric names and filenames."""
         return format(float(scale), "g")
+
+    @staticmethod
+    def boundary_area_loss_fraction(radius, boundary_distance):
+        """
+        Approximate disc area fraction clipped by a locally straight boundary.
+
+        For a disc of radius r and nearest-boundary distance d from its center,
+        the lost circular-segment area is
+        r^2 * arccos(d/r) - d * sqrt(r^2 - d^2), divided by pi*r^2.
+        """
+        r = float(radius)
+        d = float(boundary_distance)
+        if not np.isfinite(r) or r <= 0.0:
+            return np.nan
+        if not np.isfinite(d):
+            return 0.0
+        if d >= r:
+            return 0.0
+        x = min(1.0, max(0.0, d / r))
+        return float((np.arccos(x) - x * np.sqrt(max(0.0, 1.0 - x * x))) / np.pi)
 
     @staticmethod
     def _validate_mesh_inputs(vertices, faces, cortex_mask):
@@ -880,44 +862,6 @@ class FastCorticalWiringAnalysis:
         normals[good] /= norms[good][:, None]
         normals[~good] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         return normals
-
-    def _tangent_frame_at_subvertex(self, sub_idx):
-        """Return an orthonormal tangent frame (e1, e2, n) at a submesh vertex."""
-        n = np.asarray(self.vertex_normals_sub[int(sub_idx)], dtype=np.float64)
-        n_norm = float(np.linalg.norm(n))
-        if not np.isfinite(n_norm) or n_norm <= 0.0:
-            n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        else:
-            n = n / n_norm
-
-        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        if abs(float(np.dot(ref, n))) > 0.95:
-            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-
-        e1 = np.cross(n, ref)
-        e1_norm = float(np.linalg.norm(e1))
-        if e1_norm <= 0.0 or not np.isfinite(e1_norm):
-            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            e1 = np.cross(n, ref)
-            e1_norm = float(np.linalg.norm(e1))
-        if e1_norm <= 0.0 or not np.isfinite(e1_norm):
-            return (
-                np.array([1.0, 0.0, 0.0], dtype=np.float64),
-                np.array([0.0, 1.0, 0.0], dtype=np.float64),
-                np.array([0.0, 0.0, 1.0], dtype=np.float64),
-            )
-
-        e1 = e1 / e1_norm
-        e2 = np.cross(n, e1)
-        e2_norm = float(np.linalg.norm(e2))
-        if e2_norm <= 0.0 or not np.isfinite(e2_norm):
-            return (
-                np.array([1.0, 0.0, 0.0], dtype=np.float64),
-                np.array([0.0, 1.0, 0.0], dtype=np.float64),
-                np.array([0.0, 0.0, 1.0], dtype=np.float64),
-            )
-        e2 = e2 / e2_norm
-        return e1, e2, n
 
     # ========================================================================
     # GEODESIC DISTANCE COMPUTATION
@@ -1211,168 +1155,6 @@ class FastCorticalWiringAnalysis:
                         perim += float(best_d)
         return float(perim)
 
-    def _compute_log_map_at_subvertex(self, sub_idx):
-        """
-        Compute tangent-plane log-map coordinates from a source submesh vertex.
-
-        Returns None when log-map anisotropy is not enabled or unavailable.
-        """
-        if self._vector_heat_solver is None:
-            return None
-        log_map = self._vector_heat_solver.compute_log_map(int(sub_idx))
-        log_map = np.asarray(log_map, dtype=np.float64)
-        if log_map.shape != (self.n_vertices, 2):
-            raise ValueError(
-                f"Vector heat log map returned shape {log_map.shape}; expected ({self.n_vertices}, 2)."
-            )
-        return np.ascontiguousarray(log_map)
-
-    def _anisotropy_at_radius(self, log_map_xy, distances_sub, radius):
-        """
-        Eigenvalue ratio of the area-weighted second-moment tensor of a geodesic disk.
-
-        Returns 1 - lambda_min / lambda_max in [0, 1]. Values near 0 indicate an
-        isotropic disk in tangent coordinates; values near 1 indicate elongation.
-        """
-        if log_map_xy is None:
-            return np.nan
-        r = float(radius)
-        if not np.isfinite(r) or r <= 0.0:
-            return np.nan
-
-        d = np.asarray(distances_sub, dtype=np.float64)
-        xy_all = np.asarray(log_map_xy, dtype=np.float64)
-        if xy_all.ndim != 2 or xy_all.shape[1] != 2 or xy_all.shape[0] != d.shape[0]:
-            return np.nan
-
-        interior = np.isfinite(d) & (d <= r + self.eps)
-        interior &= np.isfinite(xy_all[:, 0]) & np.isfinite(xy_all[:, 1])
-        if int(np.sum(interior)) < 3:
-            return np.nan
-
-        xy = xy_all[interior]
-        w = self.vertex_areas_sub[interior]
-        wsum = float(np.sum(w))
-        if not np.isfinite(wsum) or wsum <= 0.0:
-            return np.nan
-
-        mean_xy = (xy * w[:, None]).sum(axis=0) / wsum
-        centered = xy - mean_xy
-        cov = (centered[:, :, None] * centered[:, None, :] * w[:, None, None]).sum(axis=0) / wsum
-        eigvals = np.linalg.eigvalsh(cov)
-        if eigvals.shape[0] != 2 or eigvals[1] <= 0.0 or not np.all(np.isfinite(eigvals)):
-            return np.nan
-        ratio = max(0.0, min(1.0, float(eigvals[0] / eigvals[1])))
-        return 1.0 - ratio
-
-    def _disk_anisotropy_from_vertices(self, sub_idx, distances_sub, radius):
-        """
-        Legacy tangent-projection anisotropy helper retained for tests/backcompat.
-
-        This is an extrinsic approximation and returns 1 - lambda_min/lambda_max,
-        so round disks are near 0 and elongated disks approach 1. The production
-        anisotropy metric uses _anisotropy_at_radius with intrinsic log-map
-        coordinates when vector heat is enabled.
-        """
-        r = float(radius)
-        if not np.isfinite(r) or r <= 0.0:
-            return np.nan
-        d = np.asarray(distances_sub, dtype=np.float64)
-        interior = np.isfinite(d) & (d <= r + self.eps)
-        if int(np.sum(interior)) < 3:
-            return np.nan
-
-        e1, e2, _ = self._tangent_frame_at_subvertex(sub_idx)
-        origin = self.vertices[int(sub_idx)]
-        delta = self.vertices[interior] - origin
-        xy = np.column_stack((delta @ e1, delta @ e2))
-        w = self.vertex_areas_sub[interior]
-        wsum = float(np.sum(w))
-        if not np.isfinite(wsum) or wsum <= 0.0:
-            return np.nan
-
-        mean_xy = (xy * w[:, None]).sum(axis=0) / wsum
-        centered = xy - mean_xy
-        cov = (centered[:, :, None] * centered[:, None, :] * w[:, None, None]).sum(axis=0) / wsum
-        eigvals = np.linalg.eigvalsh(cov)
-        if eigvals[1] <= 0.0 or not np.all(np.isfinite(eigvals)):
-            return np.nan
-        ratio = max(0.0, min(1.0, float(eigvals[0] / eigvals[1])))
-        return 1.0 - ratio
-
-    def _ensure_sample_storage_capacity(self, needed_width):
-        """Grow NaN-padded sampled radius/area storage when a row exceeds capacity."""
-        needed_width = int(needed_width)
-        if needed_width <= 0:
-            return
-        if self.sampled_radii is None or self.sampled_areas is None:
-            width = max(needed_width, 1)
-            self.sampled_radii = np.full((self.n_vertices_full, width), np.nan, dtype=np.float32)
-            self.sampled_areas = np.full((self.n_vertices_full, width), np.nan, dtype=np.float32)
-            self.n_samples_per_vertex = np.zeros(self.n_vertices_full, dtype=np.int32)
-            return
-        current = int(self.sampled_radii.shape[1])
-        if needed_width <= current:
-            return
-        new_width = max(needed_width, current * 2)
-        pad = new_width - current
-        self.sampled_radii = np.pad(
-            self.sampled_radii,
-            ((0, 0), (0, pad)),
-            mode="constant",
-            constant_values=np.nan,
-        )
-        self.sampled_areas = np.pad(
-            self.sampled_areas,
-            ((0, 0), (0, pad)),
-            mode="constant",
-            constant_values=np.nan,
-        )
-
-    def _store_vertex_area_samples(self, orig_idx, samples, max_radius=None):
-        """Deduplicate, sort, boundary-filter, and store sampled (radius, area) pairs."""
-        if self.sampled_radii is None or self.sampled_areas is None or self.n_samples_per_vertex is None:
-            self._ensure_sample_storage_capacity(1)
-
-        clean = []
-        for r, a in samples:
-            r_f = float(r)
-            a_f = float(a)
-            if not (np.isfinite(r_f) and np.isfinite(a_f)):
-                continue
-            if r_f < 0.0:
-                continue
-            if max_radius is not None and np.isfinite(max_radius) and r_f > float(max_radius):
-                continue
-            clean.append((r_f, a_f))
-
-        if not clean:
-            self.n_samples_per_vertex[int(orig_idx)] = 0
-            return 0
-
-        clean.sort(key=lambda item: item[0])
-        radii = np.asarray([item[0] for item in clean], dtype=np.float64)
-        total_range = float(np.max(radii) - np.min(radii)) if radii.size else 0.0
-        tol = max(1e-12, 1e-9 * total_range)
-
-        dedup = []
-        for r, a in clean:
-            if dedup and abs(r - dedup[-1][0]) <= tol:
-                dedup[-1] = (r, a)
-            else:
-                dedup.append((r, a))
-
-        n = len(dedup)
-        self._ensure_sample_storage_capacity(n)
-        row = int(orig_idx)
-        self.sampled_radii[row, :] = np.nan
-        self.sampled_areas[row, :] = np.nan
-        if n:
-            self.sampled_radii[row, :n] = np.asarray([x[0] for x in dedup], dtype=np.float32)
-            self.sampled_areas[row, :n] = np.asarray([x[1] for x in dedup], dtype=np.float32)
-        self.n_samples_per_vertex[row] = np.int32(n)
-        return n
-
     def _find_radius_for_area(
         self,
         distances_sub,
@@ -1560,6 +1342,41 @@ class FastCorticalWiringAnalysis:
             adj[ic].add(ia); adj[ic].add(ib)
         return [sorted(list(s)) for s in adj]
 
+    def _report_connected_components(self):
+        """Print a diagnostic summary of cortical submesh graph connectivity."""
+        n = len(self._adj)
+        if n == 0:
+            print("Connected components in cortical submesh: 0")
+            return
+        try:
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.csgraph import connected_components
+
+            indptr = np.zeros(n + 1, dtype=np.int64)
+            indices = []
+            for i, row in enumerate(self._adj):
+                indices.extend(int(v) for v in row)
+                indptr[i + 1] = len(indices)
+            graph = csr_matrix(
+                (np.ones(len(indices), dtype=np.uint8), np.asarray(indices, dtype=np.int32), indptr),
+                shape=(n, n),
+            )
+            n_components, labels = connected_components(graph, directed=False, return_labels=True)
+            counts = np.bincount(labels, minlength=int(n_components))
+        except Exception as exc:
+            print(f"Connected components in cortical submesh: unavailable ({exc})")
+            return
+
+        print(f"Connected components in cortical submesh: {int(n_components)}")
+        if int(n_components) > 1:
+            sizes = sorted((int(x) for x in counts), reverse=True)
+            suffix = " ..." if len(sizes) > 20 else ""
+            print("Component sizes: " + ", ".join(str(x) for x in sizes[:20]) + suffix)
+            print(
+                "Radius bisection warm-starts reset across components; "
+                "the first vertex of each component pays a cold-start cost."
+            )
+
     def _bfs_order_all(self, start=0):
         """
         BFS traversal order over all components of the submesh graph.
@@ -1602,37 +1419,43 @@ class FastCorticalWiringAnalysis:
 
     def compute_all_wiring_costs(
         self,
-        compute_msd=True,
         scale=None,
         area_tol=0.01,
         vertex_subset=None,
         n_samples_between_scales=10,
-        compute_anisotropy=None,
-        boundary_cap_fraction=0.5,
+        boundary_cap_fraction=None,
         batch_size=32,
+        verbose=False,
     ):
         """
-        Compute all wiring cost metrics (MSD, radius, perimeter, anisotropy) in a single pass.
+        Compute all wiring cost metrics (MSD, radius, perimeter) in a single pass.
 
         This optimized method iterates through each cortical vertex only once. In each
         iteration, it computes the geodesic distance vector and then calculates all
-        derived metrics (MSD, radius, perimeter, anisotropy) from that vector before discarding it.
+        derived metrics (MSD, radius, perimeter) from that vector before discarding it.
         This avoids re-computing the expensive geodesic distances in separate loops.
 
         Args:
-            compute_msd (bool): Deprecated and ignored; MSD is always computed.
             scale: Single scale or iterable of scales as proportions of total cortical area.
             area_tol (float): Relative tolerance for the area binary search.
             vertex_subset: Optional iterable of original vertex indices to compute.
             n_samples_between_scales: Number of supplementary log-spaced area samples
                 between adjacent solved target-scale radii. Use 0 for bisection
                 history only; values above ~5 increase storage with diminishing returns.
-            compute_anisotropy: Optional override for log-map anisotropy computation.
-            boundary_cap_fraction: Optional multiplier on distance-to-boundary used
-                to skip supplementary samples near mesh boundaries. Set to None
-                to disable. Converged target-scale samples are always retained.
+            boundary_cap_fraction: Optional maximum estimated fraction of a
+                supplementary sample's disc area clipped by a locally straight
+                boundary. None means no cap; 0.0 rejects supplementary discs
+                as soon as they cross the boundary; values must be in [0, 0.5).
+                This uses closed-form Euclidean circular-segment geometry and
+                assumes a locally planar boundary and locally Euclidean disc.
+                On highly curved cortex, true area loss may differ by O(K*r^2),
+                where K is local Gaussian curvature; the dominant error in
+                those regimes is curvature correction to area = pi*r^2, not
+                the segment geometry. The cap applies only to supplementary
+                samples; converged target-scale radii are always retained.
             batch_size: Number of source vertices per geodesic batch. Values <= 1
                 force single-source batches.
+            verbose: Emit per-vertex timing lines in addition to the end-of-run summary.
         """
         scales = self.normalize_scales(scale)
         batch_size = int(batch_size)
@@ -1645,16 +1468,17 @@ class FastCorticalWiringAnalysis:
             boundary_cap_value = None
         else:
             boundary_cap_value = float(boundary_cap_fraction)
-            if not np.isfinite(boundary_cap_value) or boundary_cap_value < 0.0:
-                raise ValueError("boundary_cap_fraction must be finite and >= 0, or None.")
-        do_anisotropy = self.compute_anisotropy if compute_anisotropy is None else bool(compute_anisotropy)
-        if do_anisotropy and self._vector_heat_solver is None:
-            self._initialize_vector_heat_solver(strict=self.strict_anisotropy)
+            if not np.isfinite(boundary_cap_value) or boundary_cap_value < 0.0 or boundary_cap_value >= 0.5:
+                raise ValueError(
+                    "boundary_cap_fraction must be in [0, 0.5), or None. "
+                    "Values >= 0.5 are not geometrically meaningful; use None for no cap."
+                )
 
         self.active_scales = scales
         self.n_samples_between_scales = n_samples_between_scales
         self.boundary_cap_fraction = boundary_cap_value
-        self.msd[:] = np.nan
+        self.msd_unweighted[:] = np.nan
+        self.msd_weighted[:] = np.nan
         self.dist_to_boundary = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
         self.radius_function = {
             float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
@@ -1662,13 +1486,34 @@ class FastCorticalWiringAnalysis:
         self.perimeter_function = {
             float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
         }
-        self.anisotropy_function = {
-            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
-        }
-        initial_sample_width = max(1, len(scales) * 80 + max(0, len(scales) - 1) * n_samples_between_scales)
-        self.sampled_radii = np.full((self.n_vertices_full, initial_sample_width), np.nan, dtype=np.float32)
-        self.sampled_areas = np.full((self.n_vertices_full, initial_sample_width), np.nan, dtype=np.float32)
-        self.n_samples_per_vertex = np.zeros(self.n_vertices_full, dtype=np.int32)
+        self.sample_radii_flat = None
+        self.sample_areas_flat = None
+        self.sample_indptr = None
+        sample_buffers = [None] * self.n_vertices_full
+
+        def _clean_vertex_samples(samples):
+            clean = []
+            for r, a in samples:
+                r_f = float(r)
+                a_f = float(a)
+                if not (np.isfinite(r_f) and np.isfinite(a_f)):
+                    continue
+                if r_f < 0.0:
+                    continue
+                clean.append((r_f, a_f))
+            if not clean:
+                return []
+            clean.sort(key=lambda item: item[0])
+            radii = np.asarray([item[0] for item in clean], dtype=np.float64)
+            total_range = float(np.max(radii) - np.min(radii)) if radii.size else 0.0
+            tol = max(1e-12, 1e-9 * total_range)
+            dedup = []
+            for r, a in clean:
+                if dedup and abs(r - dedup[-1][0]) <= tol:
+                    dedup[-1] = (r, a)
+                else:
+                    dedup.append((r, a))
+            return dedup
 
         print("Computing Mean Separation Distances and Local Wiring Costs...")
 
@@ -1712,8 +1557,6 @@ class FastCorticalWiringAnalysis:
         _t_dminmax  = 0.0
         _t_radius   = 0.0
         _t_perim    = 0.0
-        _t_logmap   = 0.0
-        _t_anisotropy = 0.0
         _t_samples  = 0.0
         _n_iters    = 0
         _n_total    = len(order_sub)
@@ -1740,11 +1583,6 @@ class FastCorticalWiringAnalysis:
                     d_sub = np.ascontiguousarray(d_batch[:, batch_col], dtype=np.float64)
                     _dt_geodesic = _dt_geodesic_per_source
 
-                    _t0 = _time.perf_counter()
-                    log_map_xy = self._compute_log_map_at_subvertex(sub_idx) if do_anisotropy else None
-                    _dt_logmap = _time.perf_counter() - _t0
-                    _t_logmap += _dt_logmap
-
                     orig_idx = self.sub_to_orig[sub_idx]
 
                     if self.boundary_indices.size:
@@ -1759,15 +1597,19 @@ class FastCorticalWiringAnalysis:
                     _t0 = _time.perf_counter()
                     valid = (d_sub > self.eps) & np.isfinite(d_sub)
                     if np.any(valid):
+                        d_valid = d_sub[valid]
                         w = self.vertex_areas_sub[valid]
                         wsum = float(np.sum(w))
+                        msd_unweighted_val = float(np.mean(d_valid))
                         if np.isfinite(wsum) and wsum > 0.0:
-                            msd_val = float((d_sub[valid] * w).sum() / wsum)
+                            msd_weighted_val = float((d_valid * w).sum() / wsum)
                         else:
-                            msd_val = np.nan
+                            msd_weighted_val = np.nan
                     else:
-                        msd_val = np.nan
-                    self.msd[orig_idx] = np.float32(msd_val)
+                        msd_unweighted_val = np.nan
+                        msd_weighted_val = np.nan
+                    self.msd_unweighted[orig_idx] = np.float32(msd_unweighted_val)
+                    self.msd_weighted[orig_idx] = np.float32(msd_weighted_val)
                     _dt_msd = _time.perf_counter() - _t0
                     _t_msd += _dt_msd
 
@@ -1788,7 +1630,6 @@ class FastCorticalWiringAnalysis:
                     _is_first_vertex = (_n_iters == 0)
                     _dt_radius_iter = 0.0
                     _dt_perim_iter = 0.0
-                    _dt_anisotropy_iter = 0.0
                     _bisection_iters_by_scale = []
                     _area_samples_for_vertex = []
                     for s in scales:
@@ -1847,17 +1688,7 @@ class FastCorticalWiringAnalysis:
                                 neighbor_range=_neighbor_range,
                                 r_euclid=r_euclid_by_scale[scale_key],
                             )
-                        if isinstance(_r_out, tuple):
-                            if len(_r_out) >= 3:
-                                r, _bcount, _history = _r_out[:3]
-                            elif len(_r_out) == 2:
-                                r, _bcount = _r_out
-                                _history = []
-                            else:
-                                r, _bcount, _history = _r_out[0], 0, []
-                        else:
-                            # Compatibility for tests/mocks that still return a scalar radius.
-                            r, _bcount, _history = _r_out, 0, []
+                        r, _bcount, _history = _r_out
                         _dt_radius = _time.perf_counter() - _t0
                         _t_radius += _dt_radius
                         _dt_radius_iter += _dt_radius
@@ -1868,7 +1699,6 @@ class FastCorticalWiringAnalysis:
                             r_sub[sub_idx] = np.nan
                             self.radius_function[scale_key][orig_idx] = np.nan
                             self.perimeter_function[scale_key][orig_idx] = np.nan
-                            self.anisotropy_function[scale_key][orig_idx] = np.nan
                             continue
 
                         _bisection_iters_by_scale.append(int(_bcount))
@@ -1881,26 +1711,12 @@ class FastCorticalWiringAnalysis:
                         _t_perim += _dt_perim
                         _dt_perim_iter += _dt_perim
 
-                        _t0 = _time.perf_counter()
-                        if log_map_xy is not None:
-                            anisotropy_val = self._anisotropy_at_radius(log_map_xy, d_sub, r)
-                        elif do_anisotropy:
-                            anisotropy_val = np.nan
-                        else:
-                            anisotropy_val = self._disk_anisotropy_from_vertices(sub_idx, d_sub, r)
-                        _dt_anis = _time.perf_counter() - _t0
-                        _t_anisotropy += _dt_anis
-                        _dt_anisotropy_iter += _dt_anis
                         r_sub[sub_idx] = np.float32(r)
                         self.radius_function[scale_key][orig_idx] = np.float32(r)
                         self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
-                        self.anisotropy_function[scale_key][orig_idx] = np.float32(anisotropy_val)
 
                     _t0 = _time.perf_counter()
-                    if boundary_cap_value is not None and np.isfinite(self.dist_to_boundary[orig_idx]):
-                        boundary_cap = boundary_cap_value * float(self.dist_to_boundary[orig_idx])
-                    else:
-                        boundary_cap = np.inf
+                    d_b_for_cap = None if boundary_cap_value is None else float(self.dist_to_boundary[orig_idx])
                     if n_samples_between_scales > 0:
                         solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
                         for i in range(len(solved_radii_for_vertex) - 1):
@@ -1916,8 +1732,9 @@ class FastCorticalWiringAnalysis:
                                 )
                             )[1:-1]
                             for r_extra in extra_rs:
-                                if float(r_extra) > boundary_cap:
-                                    continue
+                                if boundary_cap_value is not None:
+                                    if self.boundary_area_loss_fraction(float(r_extra), d_b_for_cap) > boundary_cap_value:
+                                        continue
                                 a_extra = self._area_inside_radius(
                                     float(r_extra),
                                     d_sub,
@@ -1926,50 +1743,56 @@ class FastCorticalWiringAnalysis:
                                 )
                                 _area_samples_for_vertex.append((float(r_extra), float(a_extra)))
 
-                    self._store_vertex_area_samples(orig_idx, _area_samples_for_vertex, max_radius=None)
+                    sample_buffers[int(orig_idx)] = _clean_vertex_samples(_area_samples_for_vertex)
                     _dt_samples_iter = _time.perf_counter() - _t0
                     _t_samples += _dt_samples_iter
 
                     _n_iters += 1
                     _dt_total_iter = (
                         _dt_geodesic
-                        + _dt_logmap
                         + _dt_msd
                         + _dt_dminmax
                         + _dt_radius_iter
                         + _dt_perim_iter
-                        + _dt_anisotropy_iter
                         + _dt_samples_iter
                     )
-                    tqdm.write(
-                        f"[{_n_iters}/{_n_total}] "
-                        f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
-                        f"log_map={1000.0 * _dt_logmap:.2f}ms "
-                        f"msd={1000.0 * _dt_msd:.2f}ms "
-                        f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
-                        f"radius={1000.0 * _dt_radius_iter:.2f}ms "
-                        f"perim={1000.0 * _dt_perim_iter:.2f}ms "
-                        f"anisotropy={1000.0 * _dt_anisotropy_iter:.2f}ms "
-                        f"samples={1000.0 * _dt_samples_iter:.2f}ms "
-                        f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
-                        f"total={1000.0 * _dt_total_iter:.2f}ms"
-                    )
+                    if verbose:
+                        tqdm.write(
+                            f"[{_n_iters}/{_n_total}] "
+                            f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
+                            f"msd={1000.0 * _dt_msd:.2f}ms "
+                            f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
+                            f"radius={1000.0 * _dt_radius_iter:.2f}ms "
+                            f"perim={1000.0 * _dt_perim_iter:.2f}ms "
+                            f"samples={1000.0 * _dt_samples_iter:.2f}ms "
+                            f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
+                            f"total={1000.0 * _dt_total_iter:.2f}ms"
+                        )
                     _pbar.update(1)
 
-        if self.n_samples_per_vertex is not None and self.sampled_radii is not None:
-            max_used = int(np.max(self.n_samples_per_vertex)) if self.n_samples_per_vertex.size else 0
-            final_width = max(1, max_used)
-            self.sampled_radii = self.sampled_radii[:, :final_width]
-            self.sampled_areas = self.sampled_areas[:, :final_width]
+        sample_indptr = np.zeros(self.n_vertices_full + 1, dtype=np.int64)
+        for i, row in enumerate(sample_buffers):
+            sample_indptr[i + 1] = sample_indptr[i] + (0 if row is None else len(row))
+        total_samples = int(sample_indptr[-1])
+        sample_radii_flat = np.empty(total_samples, dtype=np.float32)
+        sample_areas_flat = np.empty(total_samples, dtype=np.float32)
+        for i, row in enumerate(sample_buffers):
+            if not row:
+                continue
+            lo = int(sample_indptr[i])
+            hi = int(sample_indptr[i + 1])
+            sample_radii_flat[lo:hi] = np.asarray([x[0] for x in row], dtype=np.float32)
+            sample_areas_flat[lo:hi] = np.asarray([x[1] for x in row], dtype=np.float32)
+        self.sample_radii_flat = sample_radii_flat
+        self.sample_areas_flat = sample_areas_flat
+        self.sample_indptr = sample_indptr
 
         _t_total = (
             _t_geodesic
-            + _t_logmap
             + _t_msd
             + _t_dminmax
             + _t_radius
             + _t_perim
-            + _t_anisotropy
             + _t_samples
         )
         if _t_total > 0 and _n_iters > 0:
@@ -1979,31 +1802,41 @@ class FastCorticalWiringAnalysis:
                 f"Timing breakdown over {_n_iters} vertices:",
                 f"  geodesic solve : {_per(_t_geodesic)}",
                 f"  geodesic batch : avg K={_avg_batch_width:.1f}, {1000.0 * _t_geodesic / _n_iters:.2f} ms/vertex",
-                f"  log map        : {_per(_t_logmap)}",
                 f"  MSD            : {_per(_t_msd)}",
                 f"  dmin/dmax      : {_per(_t_dminmax)}",
                 f"  radius bisect  : {_per(_t_radius)}  [{len(scales)} scales]",
                 f"  perimeter      : {_per(_t_perim)}  [{len(scales)} scales]",
-                f"  anisotropy     : {_per(_t_anisotropy)}  [{len(scales)} scales]",
                 f"  samples        : {_per(_t_samples)}",
                 f"  total          : {_t_total:.1f}s",
                 f"  per vertex     : {1000.0 * _t_total / _n_iters:.2f} ms/vertex",
                 f"  geodesic frac  : {100.0 * _t_geodesic / _t_total:.1f}%",
-                f"  geometry frac  : {100.0 * (_t_msd + _t_dminmax + _t_radius + _t_perim + _t_anisotropy + _t_samples) / _t_total:.1f}%",
+                f"  geometry frac  : {100.0 * (_t_msd + _t_dminmax + _t_radius + _t_perim + _t_samples) / _t_total:.1f}%",
             ]
             for line in _timing_lines:
                 print(line)
 
         # Print summary statistics at the end
-        valid_msd = self.msd[np.isfinite(self.msd)]
-        if valid_msd.size:
-            print(f"MSD stats: min={np.min(valid_msd):.2f}, max={np.max(valid_msd):.2f}, mean={np.mean(valid_msd):.2f}")
+        valid_msd_unweighted = self.msd_unweighted[np.isfinite(self.msd_unweighted)]
+        if valid_msd_unweighted.size:
+            print("MSD (unweighted, Ecker 2013 definition):")
+            print(
+                f"  min={np.min(valid_msd_unweighted):.2f}, "
+                f"max={np.max(valid_msd_unweighted):.2f}, "
+                f"mean={np.mean(valid_msd_unweighted):.2f}"
+            )
+        valid_msd_weighted = self.msd_weighted[np.isfinite(self.msd_weighted)]
+        if valid_msd_weighted.size:
+            print("MSD (area-weighted, resampling-invariant):")
+            print(
+                f"  min={np.min(valid_msd_weighted):.2f}, "
+                f"max={np.max(valid_msd_weighted):.2f}, "
+                f"mean={np.mean(valid_msd_weighted):.2f}"
+            )
 
         for s in scales:
             scale_key = float(s)
             vr = self.radius_function[scale_key][np.isfinite(self.radius_function[scale_key])]
             vp = self.perimeter_function[scale_key][np.isfinite(self.perimeter_function[scale_key])]
-            va = self.anisotropy_function[scale_key][np.isfinite(self.anisotropy_function[scale_key])]
             if vr.size:
                 print(
                     f"Radius stats @ {s*100:.2f}%: "
@@ -2014,13 +1847,8 @@ class FastCorticalWiringAnalysis:
                     f"Perimeter stats @ {s*100:.2f}%: "
                     f"min={np.min(vp):.2f}, max={np.max(vp):.2f}, mean={np.mean(vp):.2f}"
                 )
-            if va.size:
-                print(
-                    f"Anisotropy stats @ {s*100:.2f}%: "
-                    f"min={np.min(va):.3f}, max={np.max(va):.3f}, mean={np.mean(va):.3f}"
-                )
 
-        return self.msd, self.radius_function, self.perimeter_function
+        return (self.msd_unweighted, self.msd_weighted), self.radius_function, self.perimeter_function
             
     # ========================================================================
     # INPUT/OUTPUT
@@ -2029,7 +1857,8 @@ class FastCorticalWiringAnalysis:
     def get_metric_arrays(self):
         """Return computed scalar metric arrays; sampled radius/area pairs are saved separately."""
         out = {
-            "msd": self.msd,
+            "msd_unweighted": self.msd_unweighted,
+            "msd_weighted": self.msd_weighted,
             "dist_to_boundary": self.dist_to_boundary,
         }
         for scale in self.active_scales:
@@ -2037,5 +1866,12 @@ class FastCorticalWiringAnalysis:
             token = self.scale_token(scale_key)
             out[f"radius_{token}"] = self.radius_function[scale_key]
             out[f"perimeter_{token}"] = self.perimeter_function[scale_key]
-            out[f"anisotropy_{token}"] = self.anisotropy_function[scale_key]
         return out
+
+    def get_vertex_samples(self, orig_idx):
+        """Return (radii, areas) arrays for one full-mesh vertex; both float32."""
+        if self.sample_indptr is None:
+            return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+        lo = int(self.sample_indptr[int(orig_idx)])
+        hi = int(self.sample_indptr[int(orig_idx) + 1])
+        return self.sample_radii_flat[lo:hi], self.sample_areas_flat[lo:hi]

@@ -110,7 +110,7 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertIn("--sample-method {stratified,random,fps}", text)
         self.assertNotIn("--no-compute-msd", text)
 
-    def test_no_compute_msd_flag_is_rejected(self):
+    def test_removed_msd_disable_cli_flag_is_rejected(self):
         proc = subprocess.run(
             [sys.executable, "fastcw.py", "--no-compute-msd", "subjects_dir", "subject_id"],
             capture_output=True,

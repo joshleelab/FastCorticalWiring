@@ -24,12 +24,11 @@ def _validate_output_label(label):
 
 
 def _metric_names_for_scales(scales):
-    names = ["msd"]
+    names = ["msd_unweighted", "msd_weighted"]
     for scale in scales:
         token = FastCorticalWiringAnalysis.scale_token(scale)
         names.append(f"radius_{token}")
         names.append(f"perimeter_{token}")
-        names.append(f"anisotropy_{token}")
     names.append("dist_to_boundary")
     return tuple(names)
 
@@ -124,10 +123,10 @@ def _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, sca
             output_dir,
             csv_filename,
             analysis.cortex_mask_full,
-            analysis.msd,
+            analysis.msd_unweighted,
+            analysis.msd_weighted,
             analysis.radius_function,
             analysis.perimeter_function,
-            analysis.anisotropy_function,
         )
         written.append(csv_path)
 
@@ -174,16 +173,14 @@ def _run_single_surface(
     output_format,
     engine_type,
     engine_kwargs,
-    compute_msd,
     scale,
     area_tol,
     eps,
     overwrite,
     n_samples_between_scales=10,
-    boundary_cap_fraction=0.5,
+    boundary_cap_fraction=None,
     batch_size=32,
-    compute_anisotropy=False,
-    strict_anisotropy=False,
+    verbose_timing=False,
     allow_interior_nonmanifold=False,
     sample=None,
     sample_kind="frac",
@@ -194,8 +191,6 @@ def _run_single_surface(
     vertex_list=None,
 ):
     from io_utils import load_surface_and_mask
-    # Keep MSD computation always on; the flag is retained for compatibility.
-    compute_msd = True
 
     vertices, faces, cortex_mask, metadata = load_surface_and_mask(
         standard=standard,
@@ -338,19 +333,15 @@ def _run_single_surface(
         "metadata": metadata,
         "allow_interior_nonmanifold": allow_interior_nonmanifold,
     }
-    if compute_anisotropy or strict_anisotropy:
-        analysis_kwargs["compute_anisotropy"] = compute_anisotropy
-        analysis_kwargs["strict_anisotropy"] = strict_anisotropy
     analysis = FastCorticalWiringAnalysis(vertices, faces, cortex_mask, **analysis_kwargs)
     analysis.compute_all_wiring_costs(
-        compute_msd=compute_msd,
         scale=scales,
         area_tol=area_tol,
         vertex_subset=vertex_subset,
         n_samples_between_scales=n_samples_between_scales,
         boundary_cap_fraction=boundary_cap_fraction,
         batch_size=batch_size,
-        compute_anisotropy=compute_anisotropy,
+        verbose=verbose_timing,
     )
     written = _save_analysis_outputs(analysis, output_dir, output_kinds, csv_filename, scalar_stem)
 
@@ -365,16 +356,14 @@ def process_subject(
     hemispheres=["lh", "rh"],
     surf_type="pial",
     custom_label=None,
-    compute_msd=True,
     scale=FastCorticalWiringAnalysis.DEFAULT_SCALES,
     area_tol=0.01,
     eps=1e-6,
     overwrite=False,
     n_samples_between_scales=10,
-    boundary_cap_fraction=0.5,
+    boundary_cap_fraction=None,
     batch_size=32,
-    compute_anisotropy=False,
-    strict_anisotropy=False,
+    verbose_timing=False,
     allow_interior_nonmanifold=False,
     output_format="auto",
     engine_type="potpourri",
@@ -390,8 +379,6 @@ def process_subject(
     vertex_list=None,
 ):
     """Positional FreeSurfer workflow compatibility entry point."""
-    # Keep MSD computation always on; the flag is retained for compatibility.
-    compute_msd = True
     if output_dir is None:
         if output_label is None:
             raise ValueError("--output-label is required when writing positional FreeSurfer outputs.")
@@ -423,7 +410,6 @@ def process_subject(
             output_format=output_format,
             engine_type=engine_type,
             engine_kwargs=resolved_engine_kwargs,
-            compute_msd=compute_msd,
             scale=scale,
             area_tol=area_tol,
             eps=eps,
@@ -431,8 +417,7 @@ def process_subject(
             n_samples_between_scales=n_samples_between_scales,
             boundary_cap_fraction=boundary_cap_fraction,
             batch_size=batch_size,
-            compute_anisotropy=compute_anisotropy,
-            strict_anisotropy=strict_anisotropy,
+            verbose_timing=verbose_timing,
             allow_interior_nonmanifold=allow_interior_nonmanifold,
             sample=sample,
             sample_kind=sample_kind,
@@ -546,13 +531,6 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing output files")
     parser.add_argument(
-        "--compute-msd",
-        dest="compute_msd",
-        action="store_true",
-        default=True,
-        help="Compute MSDs (always enabled; flag retained for compatibility)",
-    )
-    parser.add_argument(
         "--scale",
         nargs="+",
         type=float,
@@ -576,20 +554,14 @@ def run_cli(default_engine="potpourri"):
     parser.add_argument(
         "--boundary-cap-fraction",
         type=_parse_optional_float,
-        default=0.5,
-        help="Skip supplementary radius/area samples beyond this fraction of distance-to-boundary; use 'none' to disable",
+        default=None,
+        help="Skip supplementary samples whose estimated boundary-clipped disc area fraction exceeds this value (0.05 = 5 percent area-loss tolerance); unset or 'none' disables the cap",
     )
     parser.add_argument(
-        "--compute-anisotropy",
+        "--verbose-timing",
         action="store_true",
         default=False,
-        help="Enable intrinsic log-map anisotropy via potpourri3d MeshVectorHeatSolver",
-    )
-    parser.add_argument(
-        "--strict-anisotropy",
-        action="store_true",
-        default=False,
-        help="Raise an error if log-map anisotropy cannot be initialized",
+        help="Emit per-vertex timing details in addition to the end-of-run timing summary",
     )
     parser.add_argument(
         "--sample",
@@ -699,7 +671,6 @@ def run_cli(default_engine="potpourri"):
             output_format=args.output_format,
             engine_type=args.engine,
             engine_kwargs=engine_kwargs,
-            compute_msd=args.compute_msd,
             scale=args.scale,
             area_tol=args.area_tol,
             eps=args.eps,
@@ -707,8 +678,7 @@ def run_cli(default_engine="potpourri"):
             n_samples_between_scales=args.n_samples_between_scales,
             boundary_cap_fraction=args.boundary_cap_fraction,
             batch_size=args.batch_size,
-            compute_anisotropy=args.compute_anisotropy,
-            strict_anisotropy=args.strict_anisotropy,
+            verbose_timing=args.verbose_timing,
             allow_interior_nonmanifold=args.allow_interior_nonmanifold,
             sample=args.sample,
             sample_kind=args.sample_kind,
@@ -741,7 +711,6 @@ def run_cli(default_engine="potpourri"):
             hemispheres=args.hemispheres,
             surf_type=args.surf_type,
             custom_label=args.custom_label,
-            compute_msd=args.compute_msd,
             scale=args.scale,
             area_tol=args.area_tol,
             eps=args.eps,
@@ -749,8 +718,7 @@ def run_cli(default_engine="potpourri"):
             n_samples_between_scales=args.n_samples_between_scales,
             boundary_cap_fraction=args.boundary_cap_fraction,
             batch_size=args.batch_size,
-            compute_anisotropy=args.compute_anisotropy,
-            strict_anisotropy=args.strict_anisotropy,
+            verbose_timing=args.verbose_timing,
             allow_interior_nonmanifold=args.allow_interior_nonmanifold,
             output_format=args.output_format,
             engine_type=args.engine,

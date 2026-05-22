@@ -30,23 +30,26 @@ class _StubAnalysis:
         n = int(cortex_mask.shape[0])
         self.cortex_mask_full = np.asarray(cortex_mask, dtype=bool)
         self.n_vertices_full = n
-        self.msd = np.full(n, np.nan, dtype=np.float32)
+        self.msd_unweighted = np.full(n, np.nan, dtype=np.float32)
+        self.msd_weighted = np.full(n, np.nan, dtype=np.float32)
         self.active_scales = (0.05,)
         self.radius_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
         self.perimeter_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
-        self.anisotropy_function = {0.05: np.full(n, np.nan, dtype=np.float32)}
+        self.sample_radii_flat = np.empty(0, dtype=np.float32)
+        self.sample_areas_flat = np.empty(0, dtype=np.float32)
+        self.sample_indptr = np.zeros(n + 1, dtype=np.int64)
         self.metadata = {}
 
     def compute_all_wiring_costs(self, **kwargs):
         _StubAnalysis.last_compute_kwargs = dict(kwargs)
-        return self.msd, self.radius_function, self.perimeter_function
+        return (self.msd_unweighted, self.msd_weighted), self.radius_function, self.perimeter_function
 
     def get_metric_arrays(self):
         return {
-            "msd": self.msd,
+            "msd_unweighted": self.msd_unweighted,
+            "msd_weighted": self.msd_weighted,
             "radius_0.05": self.radius_function[0.05],
             "perimeter_0.05": self.perimeter_function[0.05],
-            "anisotropy_0.05": self.anisotropy_function[0.05],
         }
 
 
@@ -176,7 +179,6 @@ class SamplingDispatchTests(unittest.TestCase):
                             output_format="csv",
                             engine_type="potpourri",
                             engine_kwargs={},
-                            compute_msd=False,
                             scale=0.05,
                             area_tol=0.01,
                             eps=1e-6,
