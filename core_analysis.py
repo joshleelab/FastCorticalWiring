@@ -1147,7 +1147,7 @@ class FastCorticalWiringAnalysis:
         distances_sub,
         target_area,
         tol=0.01,
-        max_iter=30,
+        max_iter=80,
         dmin=None,
         dmax=None,
         r_init=None,
@@ -1678,7 +1678,7 @@ class FastCorticalWiringAnalysis:
                                     r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
                                     r_upper=_cold_r_euclid + _cold_delta0,
                                     delta0=_cold_delta0,
-                                    max_iter=50,
+                                    max_iter=120,
                                     sorted_dmax=sorted_dmax,
                                     cumulative_inside_area=cumulative_inside_area,
                                 )
