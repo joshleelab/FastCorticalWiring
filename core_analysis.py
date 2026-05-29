@@ -25,7 +25,7 @@ PERFORMANCE OPTIMIZATIONS:
 - Candidate face filtering for area/perimeter (iso-band only)
 - Precomputed face geometry/length scales for clipping tolerances
 - BFS vertex ordering + warm-started radius bracketing
-- Optional Numba JIT for the face-clipping loops
+- Required Numba JIT for the face-clipping loops
 
 GEOMETRY OPTIMIZATION NOTE:
 The 2026 geometry optimization round changed face-area summation order for
@@ -41,9 +41,9 @@ import numpy as np
 from collections import deque
 from tqdm import tqdm  # Progress bars
 import warnings
+from numba import njit
 
 from distance_engines import create_distance_engine
-warnings.filterwarnings('ignore')
 
 
 def classify_nonmanifold_vertices(vertices, faces):
@@ -103,107 +103,242 @@ def classify_nonmanifold_vertices(vertices, faces):
     }
 
 # ============================================================================
-# OPTIONAL DEPENDENCIES: Numba JIT
-# ============================================================================
-
-# Try to import Numba for Just-In-Time compilation of critical loops
-# This can provide 10-100x speedup for the geometric intersection computations
-try:
-    from numba import njit  # imported only to set flag; used inside guarded block
-    NUMBA_AVAILABLE = True
-except Exception:
-    NUMBA_AVAILABLE = False
-
-# ============================================================================
 # NUMBA JIT KERNELS (Optimized Workspace Allocations)
 # ============================================================================
 
-if NUMBA_AVAILABLE:
-    @njit(fastmath=True, cache=True)
-    def _sign_eps(x, eps):
-        if x < -eps:
-            return -1
-        if x > eps:
-            return 1
-        return 0
+@njit(fastmath=True, cache=True)
+def _sign_eps(x, eps):
+    if x < -eps:
+        return -1
+    if x > eps:
+        return 1
+    return 0
 
-    @njit(fastmath=True, cache=True)
-    def _edge_intersection_point(pi, pj, di, dj, r, abs_tol):
-        if abs(di - r) <= abs_tol:
-            return pi[0], pi[1], pi[2], True
-        if abs(dj - r) <= abs_tol:
-            return pj[0], pj[1], pj[2], True
+@njit(fastmath=True, cache=True)
+def _edge_intersection_point(pi, pj, di, dj, r, abs_tol):
+    if abs(di - r) <= abs_tol:
+        return pi[0], pi[1], pi[2], True
+    if abs(dj - r) <= abs_tol:
+        return pj[0], pj[1], pj[2], True
 
-        denom = dj - di
-        if abs(denom) < 1e-20:
-            return 0.0, 0.0, 0.0, False
+    denom = dj - di
+    if abs(denom) < 1e-20:
+        return 0.0, 0.0, 0.0, False
 
-        t = (r - di) / denom
-        if t < 0.0:
-            t = 0.0
-        elif t > 1.0:
-            t = 1.0
+    t = (r - di) / denom
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
 
-        return (
-            pi[0] + (pj[0] - pi[0]) * t,
-            pi[1] + (pj[1] - pi[1]) * t,
-            pi[2] + (pj[2] - pi[2]) * t,
-            True,
-        )
+    return (
+        pi[0] + (pj[0] - pi[0]) * t,
+        pi[1] + (pj[1] - pi[1]) * t,
+        pi[2] + (pj[2] - pi[2]) * t,
+        True,
+    )
 
-    @njit(fastmath=True, cache=True)
-    def _farthest_pair(P, m):
-        best_i = 0
-        best_j = 1
-        best_d = -1.0
+@njit(fastmath=True, cache=True)
+def _farthest_pair(P, m):
+    best_i = 0
+    best_j = 1
+    best_d = -1.0
 
-        for i in range(m):
-            for j in range(i + 1, m):
-                dx = P[j, 0] - P[i, 0]
-                dy = P[j, 1] - P[i, 1]
-                dz = P[j, 2] - P[i, 2]
-                d2 = dx * dx + dy * dy + dz * dz
-                if d2 > best_d:
-                    best_d = d2
-                    best_i = i
-                    best_j = j
-        return best_i, best_j, best_d ** 0.5
+    for i in range(m):
+        for j in range(i + 1, m):
+            dx = P[j, 0] - P[i, 0]
+            dy = P[j, 1] - P[i, 1]
+            dz = P[j, 2] - P[i, 2]
+            d2 = dx * dx + dy * dy + dz * dz
+            if d2 > best_d:
+                best_d = d2
+                best_i = i
+                best_j = j
+    return best_i, best_j, best_d ** 0.5
 
-    @njit(fastmath=True, cache=True)
-    def _triangle_area_with_unit_normal(a, b, c, n):
-        v1x = b[0] - a[0]
-        v1y = b[1] - a[1]
-        v1z = b[2] - a[2]
-        v2x = c[0] - a[0]
-        v2y = c[1] - a[1]
-        v2z = c[2] - a[2]
+@njit(fastmath=True, cache=True)
+def _triangle_area_with_unit_normal(a, b, c, n):
+    v1x = b[0] - a[0]
+    v1y = b[1] - a[1]
+    v1z = b[2] - a[2]
+    v2x = c[0] - a[0]
+    v2y = c[1] - a[1]
+    v2z = c[2] - a[2]
 
-        cx = v1y * v2z - v1z * v2y
-        cy = v1z * v2x - v1x * v2z
-        cz = v1x * v2y - v1y * v2x
-        return 0.5 * abs(n[0] * cx + n[1] * cy + n[2] * cz)
+    cx = v1y * v2z - v1z * v2y
+    cy = v1z * v2x - v1x * v2z
+    cz = v1x * v2y - v1y * v2x
+    return 0.5 * abs(n[0] * cx + n[1] * cy + n[2] * cz)
 
-    @njit(fastmath=True, cache=True)
-    def _area_inside_radius_band_kernel(V, F, unit_normals, face_areas, face_L, distances, r, eps, band_idx):
-        area_sum = 0.0
-        abs_tol = eps
-        rel_tol = 1e-9
-        
-        # PRE-ALLOCATE WORKSPACES: Avoids heap allocation inside the tight loop
-        P = np.zeros((3, 3), dtype=np.float64)
-        P1 = np.zeros(3, dtype=np.float64)
-        P2 = np.zeros(3, dtype=np.float64)
-        
-        for k in range(band_idx.shape[0]):
-            f_idx = band_idx[k]
-            i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
-            d0, d1, d2 = distances[i0], distances[i1], distances[i2]
-            
-            if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
-                continue
-                
+@njit(fastmath=True, cache=True)
+def _area_inside_radius_band_kernel(V, F, unit_normals, face_areas, face_L, distances, r, eps, band_idx):
+    area_sum = 0.0
+    abs_tol = eps
+    rel_tol = 1e-9
+
+    # PRE-ALLOCATE WORKSPACES: Avoids heap allocation inside the tight loop
+    P = np.zeros((3, 3), dtype=np.float64)
+    P1 = np.zeros(3, dtype=np.float64)
+    P2 = np.zeros(3, dtype=np.float64)
+
+    for k in range(band_idx.shape[0]):
+        f_idx = band_idx[k]
+        i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
+        d0, d1, d2 = distances[i0], distances[i1], distances[i2]
+
+        if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
+            continue
+
+        v0 = V[i0]; v1 = V[i1]; v2 = V[i2]
+
+        L = face_L[f_idx]
+        tol = abs_tol + rel_tol * L
+        tol2 = tol * tol
+
+        s0 = _sign_eps(d0 - r, eps)
+        s1 = _sign_eps(d1 - r, eps)
+        s2 = _sign_eps(d2 - r, eps)
+
+        b0 = (s0 <= 0)
+        b1 = (s1 <= 0)
+        b2 = (s2 <= 0)
+        nin = (1 if b0 else 0) + (1 if b1 else 0) + (1 if b2 else 0)
+
+        if nin == 0:
+            continue
+        if nin == 3:
+            area_sum += face_areas[f_idx]
+            continue
+
+        # Reset per-face workspace index for this triangle's intersection points.
+        m = 0
+
+        if (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0)):
+            px, py, pz, ok = _edge_intersection_point(v0, v1, d0, d1, r, abs_tol)
+            if ok:
+                P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                m += 1
+
+        if (s1 * s2 < 0) or ((s1 == 0) ^ (s2 == 0)):
+            px, py, pz, ok = _edge_intersection_point(v1, v2, d1, d2, r, abs_tol)
+            if ok:
+                dup = False
+                for t in range(m):
+                    dx = px - P[t, 0]
+                    dy = py - P[t, 1]
+                    dz = pz - P[t, 2]
+                    if dx*dx + dy*dy + dz*dz <= tol2:
+                        dup = True
+                        break
+                if not dup:
+                    P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                    m += 1
+
+        if (s2 * s0 < 0) or ((s2 == 0) ^ (s0 == 0)):
+            px, py, pz, ok = _edge_intersection_point(v2, v0, d2, d0, r, abs_tol)
+            if ok:
+                dup = False
+                for t in range(m):
+                    dx = px - P[t, 0]
+                    dy = py - P[t, 1]
+                    dz = pz - P[t, 2]
+                    if dx*dx + dy*dy + dz*dz <= tol2:
+                        dup = True
+                        break
+                if not dup:
+                    P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                    m += 1
+
+        n = unit_normals[f_idx]
+
+        if nin == 1 and m >= 2:
+            a = v0 if b0 else (v1 if b1 else v2)
+            i, j, _ = _farthest_pair(P, m)
+            # Overwrite P1/P2 workspaces
+            P1[0], P1[1], P1[2] = P[i, 0], P[i, 1], P[i, 2]
+            P2[0], P2[1], P2[2] = P[j, 0], P[j, 1], P[j, 2]
+            area_sum += _triangle_area_with_unit_normal(a, P1, P2, n)
+
+        elif nin == 2:
+            if not b0:
+                vo = v0; vi1 = v1; vi2 = v2
+                do = d0
+                p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, d1, r, abs_tol)
+                p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, d2, r, abs_tol)
+            elif not b1:
+                vo = v1; vi1 = v2; vi2 = v0
+                do = d1
+                p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, d2, r, abs_tol)
+                p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, d0, r, abs_tol)
+            else:
+                vo = v2; vi1 = v0; vi2 = v1
+                do = d2
+                p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, d0, r, abs_tol)
+                p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, d1, r, abs_tol)
+
+            if ok1 and ok2:
+                P1[0], P1[1], P1[2] = p1x, p1y, p1z
+                P2[0], P2[1], P2[2] = p2x, p2y, p2z
+                outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
+                inside_area = face_areas[f_idx] - outside_area
+                if inside_area < 0.0: inside_area = 0.0
+                if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
+                area_sum += inside_area
+            elif m >= 2:
+                i, j, _ = _farthest_pair(P, m)
+                P1[0], P1[1], P1[2] = P[i, 0], P[i, 1], P[i, 2]
+                P2[0], P2[1], P2[2] = P[j, 0], P[j, 1], P[j, 2]
+                outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
+                inside_area = face_areas[f_idx] - outside_area
+                if inside_area < 0.0: inside_area = 0.0
+                if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
+                area_sum += inside_area
+
+    return area_sum
+
+@njit(fastmath=True, cache=True)
+def _area_inside_radius_vectorized_kernel(
+    V, F, unit_normals, face_areas, face_L, distances, sorted_radii, eps
+):
+    areas_out = np.zeros(sorted_radii.shape[0], dtype=np.float64)
+    abs_tol = eps
+    rel_tol = 1e-9
+    n_radii = sorted_radii.shape[0]
+
+    # PRE-ALLOCATE WORKSPACES: Avoids heap allocation inside the tight loop
+    P = np.zeros((3, 3), dtype=np.float64)
+    P1 = np.zeros(3, dtype=np.float64)
+    P2 = np.zeros(3, dtype=np.float64)
+
+    for f_idx in range(F.shape[0]):
+        i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
+        d0, d1, d2 = distances[i0], distances[i1], distances[i2]
+
+        if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
+            continue
+
+        fdmin = d0
+        if d1 < fdmin:
+            fdmin = d1
+        if d2 < fdmin:
+            fdmin = d2
+
+        fdmax = d0
+        if d1 > fdmax:
+            fdmax = d1
+        if d2 > fdmax:
+            fdmax = d2
+
+        i_fully = np.searchsorted(sorted_radii, fdmax + eps, side='left')
+        for i in range(i_fully, n_radii):
+            areas_out[i] += face_areas[f_idx]
+
+        i_band_start = np.searchsorted(sorted_radii, fdmin - eps, side='left')
+        for i in range(i_band_start, i_fully):
+            r = sorted_radii[i]
+
             v0 = V[i0]; v1 = V[i1]; v2 = V[i2]
-            
+
             L = face_L[f_idx]
             tol = abs_tol + rel_tol * L
             tol2 = tol * tol
@@ -211,27 +346,27 @@ if NUMBA_AVAILABLE:
             s0 = _sign_eps(d0 - r, eps)
             s1 = _sign_eps(d1 - r, eps)
             s2 = _sign_eps(d2 - r, eps)
-            
+
             b0 = (s0 <= 0)
             b1 = (s1 <= 0)
             b2 = (s2 <= 0)
             nin = (1 if b0 else 0) + (1 if b1 else 0) + (1 if b2 else 0)
-            
+
             if nin == 0:
                 continue
             if nin == 3:
-                area_sum += face_areas[f_idx]
+                areas_out[i] += face_areas[f_idx]
                 continue
-                
-            # Reset per-face workspace index for this triangle's intersection points.
+
+            # Reset per-radius workspace index for this triangle's intersections.
             m = 0
-            
+
             if (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0)):
                 px, py, pz, ok = _edge_intersection_point(v0, v1, d0, d1, r, abs_tol)
                 if ok:
                     P[m, 0], P[m, 1], P[m, 2] = px, py, pz
                     m += 1
-                    
+
             if (s1 * s2 < 0) or ((s1 == 0) ^ (s2 == 0)):
                 px, py, pz, ok = _edge_intersection_point(v1, v2, d1, d2, r, abs_tol)
                 if ok:
@@ -246,7 +381,7 @@ if NUMBA_AVAILABLE:
                     if not dup:
                         P[m, 0], P[m, 1], P[m, 2] = px, py, pz
                         m += 1
-                        
+
             if (s2 * s0 < 0) or ((s2 == 0) ^ (s0 == 0)):
                 px, py, pz, ok = _edge_intersection_point(v2, v0, d2, d0, r, abs_tol)
                 if ok:
@@ -263,28 +398,30 @@ if NUMBA_AVAILABLE:
                         m += 1
 
             n = unit_normals[f_idx]
-            
+
             if nin == 1 and m >= 2:
                 a = v0 if b0 else (v1 if b1 else v2)
-                i, j, _ = _farthest_pair(P, m)
-                # Overwrite P1/P2 workspaces
-                P1[0], P1[1], P1[2] = P[i, 0], P[i, 1], P[i, 2]
-                P2[0], P2[1], P2[2] = P[j, 0], P[j, 1], P[j, 2]
-                area_sum += _triangle_area_with_unit_normal(a, P1, P2, n)
-                
+                pi, pj, _ = _farthest_pair(P, m)
+                P1[0], P1[1], P1[2] = P[pi, 0], P[pi, 1], P[pi, 2]
+                P2[0], P2[1], P2[2] = P[pj, 0], P[pj, 1], P[pj, 2]
+                areas_out[i] += _triangle_area_with_unit_normal(a, P1, P2, n)
+
             elif nin == 2:
                 if not b0:
                     vo = v0; vi1 = v1; vi2 = v2
-                    do = d0; di1 = d1; di2 = d2
+                    do = d0
+                    p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, d1, r, abs_tol)
+                    p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, d2, r, abs_tol)
                 elif not b1:
                     vo = v1; vi1 = v2; vi2 = v0
-                    do = d1; di1 = d2; di2 = d0
+                    do = d1
+                    p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, d2, r, abs_tol)
+                    p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, d0, r, abs_tol)
                 else:
                     vo = v2; vi1 = v0; vi2 = v1
-                    do = d2; di1 = d0; di2 = d1
-
-                p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, di1, r, abs_tol)
-                p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, di2, r, abs_tol)
+                    do = d2
+                    p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, d0, r, abs_tol)
+                    p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, d1, r, abs_tol)
 
                 if ok1 and ok2:
                     P1[0], P1[1], P1[2] = p1x, p1y, p1z
@@ -293,256 +430,82 @@ if NUMBA_AVAILABLE:
                     inside_area = face_areas[f_idx] - outside_area
                     if inside_area < 0.0: inside_area = 0.0
                     if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
-                    area_sum += inside_area
+                    areas_out[i] += inside_area
                 elif m >= 2:
-                    i, j, _ = _farthest_pair(P, m)
-                    P1[0], P1[1], P1[2] = P[i, 0], P[i, 1], P[i, 2]
-                    P2[0], P2[1], P2[2] = P[j, 0], P[j, 1], P[j, 2]
+                    pi, pj, _ = _farthest_pair(P, m)
+                    P1[0], P1[1], P1[2] = P[pi, 0], P[pi, 1], P[pi, 2]
+                    P2[0], P2[1], P2[2] = P[pj, 0], P[pj, 1], P[pj, 2]
                     outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
                     inside_area = face_areas[f_idx] - outside_area
                     if inside_area < 0.0: inside_area = 0.0
                     if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
-                    area_sum += inside_area
-                    
-        return area_sum
+                    areas_out[i] += inside_area
 
-    @njit(fastmath=True, cache=True)
-    def _area_inside_radius_vectorized_kernel(
-        V, F, unit_normals, face_areas, face_L, distances, sorted_radii, eps
-    ):
-        areas_out = np.zeros(sorted_radii.shape[0], dtype=np.float64)
-        abs_tol = eps
-        rel_tol = 1e-9
-        n_radii = sorted_radii.shape[0]
+    return areas_out
 
-        # PRE-ALLOCATE WORKSPACES: Avoids heap allocation inside the tight loop
-        P = np.zeros((3, 3), dtype=np.float64)
-        P1 = np.zeros(3, dtype=np.float64)
-        P2 = np.zeros(3, dtype=np.float64)
+@njit(fastmath=True, cache=True)
+def _perimeter_at_radius_kernel(V, F, face_L, distances, r, eps, band_idx):
+    perim_sum = 0.0
+    abs_tol = eps
+    rel_tol = 1e-9
 
-        for f_idx in range(F.shape[0]):
-            i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
-            d0, d1, d2 = distances[i0], distances[i1], distances[i2]
+    # PRE-ALLOCATE WORKSPACE
+    P = np.zeros((3, 3), dtype=np.float64)
 
-            if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
-                continue
+    for k in range(band_idx.shape[0]):
+        f_idx = band_idx[k]
+        i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
+        d0, d1, d2 = distances[i0], distances[i1], distances[i2]
 
-            fdmin = d0
-            if d1 < fdmin:
-                fdmin = d1
-            if d2 < fdmin:
-                fdmin = d2
+        if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
+            continue
 
-            fdmax = d0
-            if d1 > fdmax:
-                fdmax = d1
-            if d2 > fdmax:
-                fdmax = d2
+        v0 = V[i0]; v1 = V[i1]; v2 = V[i2]
+        L = face_L[f_idx]
+        tol = abs_tol + rel_tol * L
+        tol2 = tol * tol
 
-            i_fully = np.searchsorted(sorted_radii, fdmax + eps, side='left')
-            for i in range(i_fully, n_radii):
-                areas_out[i] += face_areas[f_idx]
+        s0 = _sign_eps(d0 - r, eps)
+        s1 = _sign_eps(d1 - r, eps)
+        s2 = _sign_eps(d2 - r, eps)
 
-            i_band_start = np.searchsorted(sorted_radii, fdmin - eps, side='left')
-            for i in range(i_band_start, i_fully):
-                r = sorted_radii[i]
+        m = 0
 
-                v0 = V[i0]; v1 = V[i1]; v2 = V[i2]
+        if (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0)):
+            px, py, pz, ok = _edge_intersection_point(v0, v1, d0, d1, r, abs_tol)
+            if ok:
+                P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                m += 1
 
-                L = face_L[f_idx]
-                tol = abs_tol + rel_tol * L
-                tol2 = tol * tol
-
-                s0 = _sign_eps(d0 - r, eps)
-                s1 = _sign_eps(d1 - r, eps)
-                s2 = _sign_eps(d2 - r, eps)
-
-                b0 = (s0 <= 0)
-                b1 = (s1 <= 0)
-                b2 = (s2 <= 0)
-                nin = (1 if b0 else 0) + (1 if b1 else 0) + (1 if b2 else 0)
-
-                if nin == 0:
-                    continue
-                if nin == 3:
-                    areas_out[i] += face_areas[f_idx]
-                    continue
-
-                # Reset per-radius workspace index for this triangle's intersections.
-                m = 0
-
-                if (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0)):
-                    px, py, pz, ok = _edge_intersection_point(v0, v1, d0, d1, r, abs_tol)
-                    if ok:
-                        P[m, 0], P[m, 1], P[m, 2] = px, py, pz
-                        m += 1
-
-                if (s1 * s2 < 0) or ((s1 == 0) ^ (s2 == 0)):
-                    px, py, pz, ok = _edge_intersection_point(v1, v2, d1, d2, r, abs_tol)
-                    if ok:
-                        dup = False
-                        for t in range(m):
-                            dx = px - P[t, 0]
-                            dy = py - P[t, 1]
-                            dz = pz - P[t, 2]
-                            if dx*dx + dy*dy + dz*dz <= tol2:
-                                dup = True
-                                break
-                        if not dup:
-                            P[m, 0], P[m, 1], P[m, 2] = px, py, pz
-                            m += 1
-
-                if (s2 * s0 < 0) or ((s2 == 0) ^ (s0 == 0)):
-                    px, py, pz, ok = _edge_intersection_point(v2, v0, d2, d0, r, abs_tol)
-                    if ok:
-                        dup = False
-                        for t in range(m):
-                            dx = px - P[t, 0]
-                            dy = py - P[t, 1]
-                            dz = pz - P[t, 2]
-                            if dx*dx + dy*dy + dz*dz <= tol2:
-                                dup = True
-                                break
-                        if not dup:
-                            P[m, 0], P[m, 1], P[m, 2] = px, py, pz
-                            m += 1
-
-                n = unit_normals[f_idx]
-
-                if nin == 1 and m >= 2:
-                    a = v0 if b0 else (v1 if b1 else v2)
-                    pi, pj, _ = _farthest_pair(P, m)
-                    P1[0], P1[1], P1[2] = P[pi, 0], P[pi, 1], P[pi, 2]
-                    P2[0], P2[1], P2[2] = P[pj, 0], P[pj, 1], P[pj, 2]
-                    areas_out[i] += _triangle_area_with_unit_normal(a, P1, P2, n)
-
-                elif nin == 2:
-                    if not b0:
-                        vo = v0; vi1 = v1; vi2 = v2
-                        do = d0; di1 = d1; di2 = d2
-                    elif not b1:
-                        vo = v1; vi1 = v2; vi2 = v0
-                        do = d1; di1 = d2; di2 = d0
-                    else:
-                        vo = v2; vi1 = v0; vi2 = v1
-                        do = d2; di1 = d0; di2 = d1
-
-                    p1x, p1y, p1z, ok1 = _edge_intersection_point(vo, vi1, do, di1, r, abs_tol)
-                    p2x, p2y, p2z, ok2 = _edge_intersection_point(vo, vi2, do, di2, r, abs_tol)
-
-                    if ok1 and ok2:
-                        P1[0], P1[1], P1[2] = p1x, p1y, p1z
-                        P2[0], P2[1], P2[2] = p2x, p2y, p2z
-                        outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
-                        inside_area = face_areas[f_idx] - outside_area
-                        if inside_area < 0.0: inside_area = 0.0
-                        if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
-                        areas_out[i] += inside_area
-                    elif m >= 2:
-                        pi, pj, _ = _farthest_pair(P, m)
-                        P1[0], P1[1], P1[2] = P[pi, 0], P[pi, 1], P[pi, 2]
-                        P2[0], P2[1], P2[2] = P[pj, 0], P[pj, 1], P[pj, 2]
-                        outside_area = _triangle_area_with_unit_normal(vo, P1, P2, n)
-                        inside_area = face_areas[f_idx] - outside_area
-                        if inside_area < 0.0: inside_area = 0.0
-                        if inside_area > face_areas[f_idx]: inside_area = face_areas[f_idx]
-                        areas_out[i] += inside_area
-
-        return areas_out
-
-    @njit(fastmath=True, cache=True)
-    def _perimeter_at_radius_kernel(V, F, face_L, distances, r, eps, band_idx):
-        perim_sum = 0.0
-        abs_tol = eps
-        rel_tol = 1e-9
-        
-        # PRE-ALLOCATE WORKSPACE
-        P = np.zeros((3, 3), dtype=np.float64)
-        
-        for k in range(band_idx.shape[0]):
-            f_idx = band_idx[k]
-            i0, i1, i2 = F[f_idx, 0], F[f_idx, 1], F[f_idx, 2]
-            d0, d1, d2 = distances[i0], distances[i1], distances[i2]
-            
-            if not (np.isfinite(d0) and np.isfinite(d1) and np.isfinite(d2)):
-                continue
-                
-            v0 = V[i0]; v1 = V[i1]; v2 = V[i2]
-            L = face_L[f_idx]
-            tol = abs_tol + rel_tol * L
-            tol2 = tol * tol
-
-            s0 = _sign_eps(d0 - r, eps)
-            s1 = _sign_eps(d1 - r, eps)
-            s2 = _sign_eps(d2 - r, eps)
-            
-            m = 0
-            
-            if (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0)):
-                px, py, pz, ok = _edge_intersection_point(v0, v1, d0, d1, r, abs_tol)
-                if ok:
+        if (s1 * s2 < 0) or ((s1 == 0) ^ (s2 == 0)):
+            px, py, pz, ok = _edge_intersection_point(v1, v2, d1, d2, r, abs_tol)
+            if ok:
+                dup = False
+                for t in range(m):
+                    dx = px - P[t, 0]; dy = py - P[t, 1]; dz = pz - P[t, 2]
+                    if dx*dx + dy*dy + dz*dz <= tol2:
+                        dup = True; break
+                if not dup:
                     P[m, 0], P[m, 1], P[m, 2] = px, py, pz
                     m += 1
-                    
-            if (s1 * s2 < 0) or ((s1 == 0) ^ (s2 == 0)):
-                px, py, pz, ok = _edge_intersection_point(v1, v2, d1, d2, r, abs_tol)
-                if ok:
-                    dup = False
-                    for t in range(m):
-                        dx = px - P[t, 0]; dy = py - P[t, 1]; dz = pz - P[t, 2]
-                        if dx*dx + dy*dy + dz*dz <= tol2:
-                            dup = True; break
-                    if not dup:
-                        P[m, 0], P[m, 1], P[m, 2] = px, py, pz
-                        m += 1
-                        
-            if (s2 * s0 < 0) or ((s2 == 0) ^ (s0 == 0)):
-                px, py, pz, ok = _edge_intersection_point(v2, v0, d2, d0, r, abs_tol)
-                if ok:
-                    dup = False
-                    for t in range(m):
-                        dx = px - P[t, 0]; dy = py - P[t, 1]; dz = pz - P[t, 2]
-                        if dx*dx + dy*dy + dz*dz <= tol2:
-                            dup = True; break
-                    if not dup:
-                        P[m, 0], P[m, 1], P[m, 2] = px, py, pz
-                        m += 1
-                        
-            if m >= 2:
-                i, j, Lij = _farthest_pair(P, m)
-                perim_sum += Lij
-                
-        return perim_sum       
-else:
-    import sys
-    import logging
 
-    # Set up a loud banner that cuts through standard terminal output
-    LOUD_WARNING = """
-    ================================================================================
-    CRITICAL PERFORMANCE WARNING: NUMBA IS NOT INSTALLED OR FAILED TO LOAD
-    ================================================================================
-    The JIT-optimized geometric kernels could not be initialized. 
-    This analysis is falling back to pure-Python polygon clipping. 
-    
-    Processing a standard FreeSurfer mesh (~150,000 vertices) in pure Python 
-    will take an EXORBITANT amount of time (potentially days instead of 1-2 hours).
-    
-    It is highly recommended that you terminate this script and install Numba:
-        pip install numba
-    ================================================================================
-    """
-    
-    # Print directly to stderr so it bypasses standard output redirection
-    print(LOUD_WARNING, file=sys.stderr)
-    
-    # Also log it just in case they are piping stderr to a file
-    logging.warning("Numba unavailable. Falling back to slow pure-Python operations.")
+        if (s2 * s0 < 0) or ((s2 == 0) ^ (s0 == 0)):
+            px, py, pz, ok = _edge_intersection_point(v2, v0, d2, d0, r, abs_tol)
+            if ok:
+                dup = False
+                for t in range(m):
+                    dx = px - P[t, 0]; dy = py - P[t, 1]; dz = pz - P[t, 2]
+                    if dx*dx + dy*dy + dz*dz <= tol2:
+                        dup = True; break
+                if not dup:
+                    P[m, 0], P[m, 1], P[m, 2] = px, py, pz
+                    m += 1
 
-    # Pure-Python fallback utilities used by non-JIT code paths
-    def _sign_eps(x, eps):
-        """Non-JIT version of sign function for Python fallback."""
-        return -1 if x < -eps else (1 if x > eps else 0)
+        if m >= 2:
+            i, j, Lij = _farthest_pair(P, m)
+            perim_sum += Lij
+
+    return perim_sum
 
 
 # ============================================================================
@@ -1068,140 +1031,8 @@ class FastCorticalWiringAnalysis:
         return out
 
     # ========================================================================
-    # HELPER FOR PYTHON FALLBACK: EDGE-ISOLINE INTERSECTIONS
-    # ========================================================================
-    
-    def _edge_intersections(self, r, d, v_face, f_idx):
-        """
-        Python fallback for finding edge-isoline intersections (when Numba unavailable).
-        
-        Returns intersection points where the level-set d=r crosses triangle edges.
-        Uses the same robust logic as the Numba kernels: scale-aware tolerance
-        and endpoint detection.
-        """
-        eps = self.eps
-        P = []
-        
-        # Use precomputed face length scale for tolerance
-        L = self.face_L[f_idx]
-        abs_tol = eps
-        rel_tol = 1e-9
-        tol = abs_tol + rel_tol * L
-        
-        # Check each edge for intersections
-        edges = ((0,1),(1,2),(2,0))
-        for a,b in edges:
-            s0 = _sign_eps(d[a] - r, eps)
-            s1 = _sign_eps(d[b] - r, eps)
-            # Edge crosses isoline if signs differ or exactly one endpoint is on isoline
-            cross = (s0 * s1 < 0) or ((s0 == 0) ^ (s1 == 0))
-            if not cross:
-                continue
-                
-            di, dj = d[a], d[b]
-            
-            # Handle endpoints on isoline
-            if abs(di - r) <= abs_tol:
-                p = v_face[a]
-            elif abs(dj - r) <= abs_tol:
-                p = v_face[b]
-            else:
-                # Linear interpolation
-                denom = (dj - di)
-                if abs(denom) < 1e-20:
-                    continue
-                t = (r - di) / denom
-                t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                p = v_face[a] + t * (v_face[b] - v_face[a])
-            
-            # Add to list if not a duplicate
-            if not any(np.linalg.norm(p - q) <= tol for q in P):
-                P.append(p)
-                
-        return P
-
-    # ========================================================================
     # AREA AND PERIMETER COMPUTATION (with candidate-face filtering)
     # ========================================================================
-    
-    def _area_band_python(self, radius, distances_sub, band_idx):
-        """Python fallback for partially clipped faces in the isoline band."""
-        r = float(radius)
-        eps = self.eps
-        V, F = self.vertices, self.faces
-        area = 0.0
-        unit_normals, areas = self.face_unit_normals, self.face_areas
-
-        for f_idx in band_idx:
-            face = F[f_idx]
-            d = distances_sub[face]
-            if not np.all(np.isfinite(d)):
-                continue
-
-            v_face = V[face]
-            inside = d <= r + eps
-            n_in = int(np.sum(inside))
-
-            if n_in == 0:
-                continue
-            if n_in == 3:
-                area += areas[f_idx]
-                continue
-
-            n = unit_normals[f_idx]
-            if n_in == 1:
-                i_inside = int(np.where(inside)[0][0])
-                P = self._edge_intersections(r, d, v_face, f_idx)
-                if len(P) < 2:
-                    continue
-                a = v_face[i_inside]
-                b, c = P[0], P[1]
-                area += 0.5 * abs(np.dot(n, np.cross(b - a, c - a)))
-            else:
-                idx_out = int(np.where(~inside)[0][0])
-                idx_in = np.where(inside)[0]
-                vo = v_face[idx_out]
-                vi1 = v_face[idx_in[0]]
-                vi2 = v_face[idx_in[1]]
-                do = d[idx_out]
-                di1 = d[idx_in[0]]
-                di2 = d[idx_in[1]]
-
-                p1, p2 = None, None
-                if abs(do - r) <= eps:
-                    p1 = vo
-                elif abs(di1 - r) <= eps:
-                    p1 = vi1
-                else:
-                    den = di1 - do
-                    if abs(den) > 1e-20:
-                        t = (r - do) / den
-                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                        p1 = vo + t * (vi1 - vo)
-
-                if abs(do - r) <= eps:
-                    p2 = vo
-                elif abs(di2 - r) <= eps:
-                    p2 = vi2
-                else:
-                    den = di2 - do
-                    if abs(den) > 1e-20:
-                        t = (r - do) / den
-                        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                        p2 = vo + t * (vi2 - vo)
-
-                if p1 is None or p2 is None:
-                    P = self._edge_intersections(r, d, v_face, f_idx)
-                    if len(P) < 2:
-                        continue
-                    p1, p2 = P[0], P[1]
-
-                outside_area = 0.5 * abs(np.dot(n, np.cross(p1 - vo, p2 - vo)))
-                inside_area = areas[f_idx] - outside_area
-                inside_area = max(0.0, min(float(areas[f_idx]), float(inside_area)))
-                area += inside_area
-
-        return float(area)
 
     def _area_inside_radius(
         self,
@@ -1244,24 +1075,21 @@ class FastCorticalWiringAnalysis:
 
         if band_idx.size == 0:
             return inside_area
-        
-        if NUMBA_AVAILABLE:
-            band_area = float(
-                _area_inside_radius_band_kernel(
-                    V,
-                    F,
-                    self.face_unit_normals,
-                    self.face_areas,
-                    self.face_L,
-                    distances_sub,
-                    r,
-                    eps,
-                    band_idx,
-                )
+
+        band_area = float(
+            _area_inside_radius_band_kernel(
+                V,
+                F,
+                self.face_unit_normals,
+                self.face_areas,
+                self.face_L,
+                distances_sub,
+                r,
+                eps,
+                band_idx,
             )
-            return inside_area + band_area
-        
-        return inside_area + self._area_band_python(r, distances_sub, band_idx)
+        )
+        return inside_area + band_area
 
     def _area_inside_radius_vectorized(self, sorted_radii, distances_sub, dmin=None, dmax=None):
         sorted_radii = np.asarray(sorted_radii, dtype=np.float64)
@@ -1269,41 +1097,17 @@ class FastCorticalWiringAnalysis:
             return np.empty(0, dtype=np.float64)
         sorted_radii = np.ascontiguousarray(sorted_radii)
 
-        if NUMBA_AVAILABLE:
-            return np.asarray(
-                _area_inside_radius_vectorized_kernel(
-                    self.vertices,
-                    self.faces,
-                    self.face_unit_normals,
-                    self.face_areas,
-                    self.face_L,
-                    distances_sub,
-                    sorted_radii,
-                    self.eps,
-                ),
-                dtype=np.float64,
-            )
-
-        if dmin is None or dmax is None:
-            df = distances_sub[self.faces]
-            dmin = df.min(axis=1)
-            dmax = df.max(axis=1)
-        dmax_order = np.argsort(dmax, kind='stable')
-        cumulative_inside_area = np.concatenate(
-            ([0.0], np.cumsum(self.face_areas[dmax_order]))
-        )
         return np.asarray(
-            [
-                self._area_inside_radius(
-                    float(r),
-                    distances_sub,
-                    dmin=dmin,
-                    dmax=dmax,
-                    sorted_dmax=dmax[dmax_order],
-                    cumulative_inside_area=cumulative_inside_area,
-                )
-                for r in sorted_radii
-            ],
+            _area_inside_radius_vectorized_kernel(
+                self.vertices,
+                self.faces,
+                self.face_unit_normals,
+                self.face_areas,
+                self.face_L,
+                distances_sub,
+                sorted_radii,
+                self.eps,
+            ),
             dtype=np.float64,
         )
 
@@ -1335,42 +1139,8 @@ class FastCorticalWiringAnalysis:
         
         # Band filtering: only faces that intersect the isoline
         band_idx = np.flatnonzero((dmin <= (r + eps)) & (dmax >= (r - eps))).astype(np.int32, copy=False)
-        
-        if NUMBA_AVAILABLE:
-            return float(_perimeter_at_radius_kernel(V, F, self.face_L, distances_sub, r, eps, band_idx))
-        
-        # Python fallback
-        perim = 0.0
-        for f_idx in band_idx:
-            face = F[f_idx]
-            d = distances_sub[face]
-            if not np.all(np.isfinite(d)):
-                continue
-                
-            v_face = V[face]
-            P = self._edge_intersections(r, d, v_face, f_idx)
-            
-            if len(P) == 2:
-                perim += float(np.linalg.norm(P[1] - P[0]))
-            elif len(P) > 2:
-                # Greedy pairing for degenerate cases (not as robust as farthest-pair)
-                used = [False]*len(P)
-                for i in range(len(P)):
-                    if used[i]:
-                        continue
-                    best_j = -1
-                    best_d = 1e30
-                    for j in range(i+1, len(P)):
-                        if used[j]:
-                            continue
-                        dd = np.linalg.norm(P[j]-P[i])
-                        if dd < best_d:
-                            best_d = dd
-                            best_j = j
-                    if best_j >= 0:
-                        used[i] = used[best_j] = True
-                        perim += float(best_d)
-        return float(perim)
+
+        return float(_perimeter_at_radius_kernel(V, F, self.face_L, distances_sub, r, eps, band_idx))
 
     def _find_radius_for_area(
         self,
@@ -1794,237 +1564,238 @@ class FastCorticalWiringAnalysis:
 
         # Batched geodesic loop over cortical vertices (BFS order for warm-start locality).
         with tqdm(total=_n_total, desc="Computing wiring costs") as _pbar:
-            for batch_start in range(0, _n_total, batch_size):
-                batch_indices = order_sub[batch_start : batch_start + batch_size]
-                if not batch_indices:
-                    continue
-                _n_batches += 1
-                _sum_batch_width += len(batch_indices)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                for batch_start in range(0, _n_total, batch_size):
+                    batch_indices = order_sub[batch_start : batch_start + batch_size]
+                    if not batch_indices:
+                        continue
+                    _n_batches += 1
+                    _sum_batch_width += len(batch_indices)
 
-                # --- Phase 1: Geodesic solve for this batch ---
-                _t0 = _time.perf_counter()
-                d_batch = self._compute_geodesic_distance_batch_from_subvertices(batch_indices)
-                _dt_geodesic_batch = _time.perf_counter() - _t0
-                _t_geodesic += _dt_geodesic_batch
-                _dt_geodesic_per_source = _dt_geodesic_batch / float(len(batch_indices))
-
-                for batch_col, sub_idx in enumerate(batch_indices):
-                    d_sub = np.ascontiguousarray(d_batch[:, batch_col], dtype=np.float64)
-                    _dt_geodesic = _dt_geodesic_per_source
-
-                    orig_idx = self.sub_to_orig[sub_idx]
-
-                    if self.boundary_indices.size:
-                        b_dists = d_sub[self.boundary_indices]
-                        b_finite = b_dists[np.isfinite(b_dists)]
-                        min_b_dist = float(np.min(b_finite)) if b_finite.size else np.nan
-                    else:
-                        min_b_dist = np.inf
-                    self.dist_to_boundary[orig_idx] = np.float32(min_b_dist)
-
-                    # --- Phase 2: MSD ---
+                    # --- Phase 1: Geodesic solve for this batch ---
                     _t0 = _time.perf_counter()
-                    valid = (d_sub > self.eps) & np.isfinite(d_sub)
-                    if np.any(valid):
-                        d_valid = d_sub[valid]
-                        w = self.vertex_areas_sub[valid]
-                        wsum = float(np.sum(w))
-                        msd_unweighted_val = float(np.mean(d_valid))
-                        if np.isfinite(wsum) and wsum > 0.0:
-                            msd_weighted_val = float((d_valid * w).sum() / wsum)
+                    d_batch = self._compute_geodesic_distance_batch_from_subvertices(batch_indices)
+                    _dt_geodesic_batch = _time.perf_counter() - _t0
+                    _t_geodesic += _dt_geodesic_batch
+                    _dt_geodesic_per_source = _dt_geodesic_batch / float(len(batch_indices))
+
+                    for batch_col, sub_idx in enumerate(batch_indices):
+                        d_sub = np.ascontiguousarray(d_batch[:, batch_col], dtype=np.float64)
+                        _dt_geodesic = _dt_geodesic_per_source
+
+                        orig_idx = self.sub_to_orig[sub_idx]
+
+                        if self.boundary_indices.size:
+                            b_dists = d_sub[self.boundary_indices]
+                            b_finite = b_dists[np.isfinite(b_dists)]
+                            min_b_dist = float(np.min(b_finite)) if b_finite.size else np.nan
                         else:
-                            msd_weighted_val = np.nan
-                    else:
-                        msd_unweighted_val = np.nan
-                        msd_weighted_val = np.nan
-                    self.msd_unweighted[orig_idx] = np.float32(msd_unweighted_val)
-                    self.msd_weighted[orig_idx] = np.float32(msd_weighted_val)
-                    _dt_msd = _time.perf_counter() - _t0
-                    _t_msd += _dt_msd
+                            min_b_dist = np.inf
+                        self.dist_to_boundary[orig_idx] = np.float32(min_b_dist)
 
-                    # --- Phase 3: dmin/dmax buffers ---
-                    _t0 = _time.perf_counter()
-                    np.take(d_sub, self._f0, out=self._d0_buf)
-                    np.take(d_sub, self._f1, out=self._d1_buf)
-                    np.take(d_sub, self._f2, out=self._d2_buf)
-                    np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
-                    np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
-                    np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
-                    np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
-                    dmax_order = np.argsort(self._dmax_buf, kind='stable')
-                    sorted_dmax = self._dmax_buf[dmax_order]
-                    cumulative_inside_area = np.concatenate(
-                        ([0.0], np.cumsum(self.face_areas[dmax_order]))
-                    )
-                    _dt_dminmax = _time.perf_counter() - _t0
-                    _t_dminmax += _dt_dminmax
-
-                    # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
-                    r_prev_scale = np.nan
-                    _is_first_vertex = (_n_iters == 0)
-                    _dt_radius_iter = 0.0
-                    _dt_perim_iter = 0.0
-                    _bisection_iters_by_scale = []
-                    _area_samples_for_vertex = []
-                    for s in scales:
-                        scale_key = float(s)
-                        r_sub = r_sub_by_scale[scale_key]
-                        solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
-
-                        neighbor_lower = None
-                        neighbor_upper = None
-                        if solved_neighbor_r:
-                            neighbors = np.asarray(solved_neighbor_r, dtype=np.float64)
-                            neighbor_eps = max(self.eps * 10.0, 1e-6)
-                            neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
-                            neighbor_upper = float(np.max(neighbors)) + neighbor_eps
-                            r_init = 0.5 * (neighbor_lower + neighbor_upper)
-                            _neighbor_range = float(np.max(neighbors)) - float(np.min(neighbors))
-                        else:
-                            r_init = r_euclid_by_scale[scale_key]
-                            _neighbor_range = 0.0
-
-                        if np.isfinite(r_prev_scale):
-                            if neighbor_lower is None:
-                                r_lower = float(r_prev_scale)
+                        # --- Phase 2: MSD ---
+                        _t0 = _time.perf_counter()
+                        valid = (d_sub > self.eps) & np.isfinite(d_sub)
+                        if np.any(valid):
+                            d_valid = d_sub[valid]
+                            w = self.vertex_areas_sub[valid]
+                            wsum = float(np.sum(w))
+                            msd_unweighted_val = float(np.mean(d_valid))
+                            if np.isfinite(wsum) and wsum > 0.0:
+                                msd_weighted_val = float((d_valid * w).sum() / wsum)
                             else:
-                                r_lower = max(neighbor_lower, float(r_prev_scale))
+                                msd_weighted_val = np.nan
                         else:
-                            r_lower = neighbor_lower
-                        r_upper = neighbor_upper
+                            msd_unweighted_val = np.nan
+                            msd_weighted_val = np.nan
+                        self.msd_unweighted[orig_idx] = np.float32(msd_unweighted_val)
+                        self.msd_weighted[orig_idx] = np.float32(msd_weighted_val)
+                        _dt_msd = _time.perf_counter() - _t0
+                        _t_msd += _dt_msd
 
+                        # --- Phase 3: dmin/dmax buffers ---
                         _t0 = _time.perf_counter()
-                        if _is_first_vertex:
-                            _cold_r_euclid = r_euclid_by_scale[scale_key]
-                            _cold_delta0 = 0.4 * _cold_r_euclid
-                            _r_out = self._find_radius_for_area(
-                                d_sub,
-                                target_areas[scale_key],
-                                tol=area_tol,
-                                dmin=self._dmin_buf,
-                                dmax=self._dmax_buf,
-                                r_init=_cold_r_euclid,
-                                r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
-                                r_upper=_cold_r_euclid + _cold_delta0,
-                                delta0=_cold_delta0,
-                                max_iter=50,
-                                sorted_dmax=sorted_dmax,
-                                cumulative_inside_area=cumulative_inside_area,
-                            )
-                        else:
-                            _r_out = self._find_radius_for_area(
-                                d_sub,
-                                target_areas[scale_key],
-                                tol=area_tol,
-                                dmin=self._dmin_buf,
-                                dmax=self._dmax_buf,
-                                r_init=r_init,
-                                r_lower=r_lower,
-                                r_upper=r_upper,
-                                neighbor_range=_neighbor_range,
-                                r_euclid=r_euclid_by_scale[scale_key],
-                                sorted_dmax=sorted_dmax,
-                                cumulative_inside_area=cumulative_inside_area,
-                            )
-                        r, _bcount, _history = _r_out
-                        _dt_radius = _time.perf_counter() - _t0
-                        _t_radius += _dt_radius
-                        _dt_radius_iter += _dt_radius
-                        if _history:
-                            _area_samples_for_vertex.extend(_history)
-                        if not np.isfinite(r):
-                            _bisection_iters_by_scale.append(0)
-                            r_sub[sub_idx] = np.nan
-                            self.radius_function[scale_key][orig_idx] = np.nan
-                            self.perimeter_function[scale_key][orig_idx] = np.nan
-                            continue
-
-                        _bisection_iters_by_scale.append(int(_bcount))
-                        r_prev_scale = float(r)
-                        _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
-
-                        _t0 = _time.perf_counter()
-                        perim = self._perimeter_at_radius(
-                            r,
-                            d_sub,
-                            dmin=self._dmin_buf,
-                            dmax=self._dmax_buf,
-                            sorted_dmax=sorted_dmax,
-                            cumulative_inside_area=cumulative_inside_area,
+                        np.take(d_sub, self._f0, out=self._d0_buf)
+                        np.take(d_sub, self._f1, out=self._d1_buf)
+                        np.take(d_sub, self._f2, out=self._d2_buf)
+                        np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
+                        np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
+                        np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
+                        np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
+                        dmax_order = np.argsort(self._dmax_buf, kind='stable')
+                        sorted_dmax = self._dmax_buf[dmax_order]
+                        cumulative_inside_area = np.concatenate(
+                            ([0.0], np.cumsum(self.face_areas[dmax_order]))
                         )
-                        _dt_perim = _time.perf_counter() - _t0
-                        _t_perim += _dt_perim
-                        _dt_perim_iter += _dt_perim
+                        _dt_dminmax = _time.perf_counter() - _t0
+                        _t_dminmax += _dt_dminmax
 
-                        r_sub[sub_idx] = np.float32(r)
-                        self.radius_function[scale_key][orig_idx] = np.float32(r)
-                        self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
+                        # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
+                        r_prev_scale = np.nan
+                        _is_first_vertex = (_n_iters == 0)
+                        _dt_radius_iter = 0.0
+                        _dt_perim_iter = 0.0
+                        _bisection_iters_by_scale = []
+                        _area_samples_for_vertex = []
+                        for s in scales:
+                            scale_key = float(s)
+                            r_sub = r_sub_by_scale[scale_key]
+                            solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
 
-                    _t0 = _time.perf_counter()
-                    d_b_for_cap = None if boundary_cap_value is None else float(self.dist_to_boundary[orig_idx])
-                    if n_samples_between_scales > 0:
-                        solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
-                        candidate_radii = []
-                        for i in range(len(solved_radii_for_vertex) - 1):
-                            r_lo = solved_radii_for_vertex[i]
-                            r_hi = solved_radii_for_vertex[i + 1]
-                            if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_hi > r_lo and r_lo > 0.0):
-                                continue
-                            extra_rs = np.exp(
-                                np.linspace(
-                                    np.log(r_lo),
-                                    np.log(r_hi),
-                                    n_samples_between_scales + 2,
-                                )
-                            )[1:-1]
-                            candidate_radii.extend(extra_rs.tolist())
+                            neighbor_lower = None
+                            neighbor_upper = None
+                            if solved_neighbor_r:
+                                neighbors = np.asarray(solved_neighbor_r, dtype=np.float64)
+                                neighbor_eps = max(self.eps * 10.0, 1e-6)
+                                neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
+                                neighbor_upper = float(np.max(neighbors)) + neighbor_eps
+                                r_init = 0.5 * (neighbor_lower + neighbor_upper)
+                                _neighbor_range = float(np.max(neighbors)) - float(np.min(neighbors))
+                            else:
+                                r_init = r_euclid_by_scale[scale_key]
+                                _neighbor_range = 0.0
 
-                        if candidate_radii:
-                            candidate_radii = np.asarray(candidate_radii, dtype=np.float64)
-                            if boundary_cap_value is not None:
-                                keep = np.array([
-                                    self.boundary_area_loss_fraction(float(r), d_b_for_cap) <= boundary_cap_value
-                                    for r in candidate_radii
-                                ])
-                                candidate_radii = candidate_radii[keep]
-                            if candidate_radii.size:
-                                candidate_radii = np.sort(candidate_radii)
-                                areas_out = self._area_inside_radius_vectorized(
-                                    candidate_radii,
+                            if np.isfinite(r_prev_scale):
+                                if neighbor_lower is None:
+                                    r_lower = float(r_prev_scale)
+                                else:
+                                    r_lower = max(neighbor_lower, float(r_prev_scale))
+                            else:
+                                r_lower = neighbor_lower
+                            r_upper = neighbor_upper
+
+                            _t0 = _time.perf_counter()
+                            if _is_first_vertex:
+                                _cold_r_euclid = r_euclid_by_scale[scale_key]
+                                _cold_delta0 = 0.4 * _cold_r_euclid
+                                _r_out = self._find_radius_for_area(
                                     d_sub,
+                                    target_areas[scale_key],
+                                    tol=area_tol,
                                     dmin=self._dmin_buf,
                                     dmax=self._dmax_buf,
+                                    r_init=_cold_r_euclid,
+                                    r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
+                                    r_upper=_cold_r_euclid + _cold_delta0,
+                                    delta0=_cold_delta0,
+                                    max_iter=50,
+                                    sorted_dmax=sorted_dmax,
+                                    cumulative_inside_area=cumulative_inside_area,
                                 )
-                                _area_samples_for_vertex.extend(
-                                    zip(candidate_radii.tolist(), areas_out.tolist())
+                            else:
+                                _r_out = self._find_radius_for_area(
+                                    d_sub,
+                                    target_areas[scale_key],
+                                    tol=area_tol,
+                                    dmin=self._dmin_buf,
+                                    dmax=self._dmax_buf,
+                                    r_init=r_init,
+                                    r_lower=r_lower,
+                                    r_upper=r_upper,
+                                    neighbor_range=_neighbor_range,
+                                    r_euclid=r_euclid_by_scale[scale_key],
+                                    sorted_dmax=sorted_dmax,
+                                    cumulative_inside_area=cumulative_inside_area,
                                 )
+                            r, _bcount, _history = _r_out
+                            _dt_radius = _time.perf_counter() - _t0
+                            _t_radius += _dt_radius
+                            _dt_radius_iter += _dt_radius
+                            if _history:
+                                _area_samples_for_vertex.extend(_history)
+                            if not np.isfinite(r):
+                                _bisection_iters_by_scale.append(0)
+                                r_sub[sub_idx] = np.nan
+                                self.radius_function[scale_key][orig_idx] = np.nan
+                                self.perimeter_function[scale_key][orig_idx] = np.nan
+                                continue
 
-                    sample_buffers[int(orig_idx)] = _clean_vertex_samples(_area_samples_for_vertex)
-                    _dt_samples_iter = _time.perf_counter() - _t0
-                    _t_samples += _dt_samples_iter
+                            _bisection_iters_by_scale.append(int(_bcount))
+                            r_prev_scale = float(r)
+                            _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
 
-                    _n_iters += 1
-                    _dt_total_iter = (
-                        _dt_geodesic
-                        + _dt_msd
-                        + _dt_dminmax
-                        + _dt_radius_iter
-                        + _dt_perim_iter
-                        + _dt_samples_iter
-                    )
-                    if verbose:
-                        tqdm.write(
-                            f"[{_n_iters}/{_n_total}] "
-                            f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
-                            f"msd={1000.0 * _dt_msd:.2f}ms "
-                            f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
-                            f"radius={1000.0 * _dt_radius_iter:.2f}ms "
-                            f"perim={1000.0 * _dt_perim_iter:.2f}ms "
-                            f"samples={1000.0 * _dt_samples_iter:.2f}ms "
-                            f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
-                            f"total={1000.0 * _dt_total_iter:.2f}ms"
+                            _t0 = _time.perf_counter()
+                            perim = self._perimeter_at_radius(
+                                r,
+                                d_sub,
+                                dmin=self._dmin_buf,
+                                dmax=self._dmax_buf,
+                                sorted_dmax=sorted_dmax,
+                                cumulative_inside_area=cumulative_inside_area,
+                            )
+                            _dt_perim = _time.perf_counter() - _t0
+                            _t_perim += _dt_perim
+                            _dt_perim_iter += _dt_perim
+
+                            r_sub[sub_idx] = np.float32(r)
+                            self.radius_function[scale_key][orig_idx] = np.float32(r)
+                            self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
+
+                        _t0 = _time.perf_counter()
+                        d_b_for_cap = None if boundary_cap_value is None else float(self.dist_to_boundary[orig_idx])
+                        if n_samples_between_scales > 0:
+                            solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
+                            candidate_radii = []
+                            for i in range(len(solved_radii_for_vertex) - 1):
+                                r_lo = solved_radii_for_vertex[i]
+                                r_hi = solved_radii_for_vertex[i + 1]
+                                if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_hi > r_lo and r_lo > 0.0):
+                                    continue
+                                extra_rs = np.exp(
+                                    np.linspace(
+                                        np.log(r_lo),
+                                        np.log(r_hi),
+                                        n_samples_between_scales + 2,
+                                    )
+                                )[1:-1]
+                                candidate_radii.extend(extra_rs.tolist())
+
+                            if candidate_radii:
+                                candidate_radii = np.asarray(candidate_radii, dtype=np.float64)
+                                if boundary_cap_value is not None:
+                                    keep = np.array([
+                                        self.boundary_area_loss_fraction(float(r), d_b_for_cap) <= boundary_cap_value
+                                        for r in candidate_radii
+                                    ])
+                                    candidate_radii = candidate_radii[keep]
+                                if candidate_radii.size:
+                                    candidate_radii = np.sort(candidate_radii)
+                                    areas_out = self._area_inside_radius_vectorized(
+                                        candidate_radii,
+                                        d_sub,
+                                        dmin=self._dmin_buf,
+                                        dmax=self._dmax_buf,
+                                    )
+                                    _area_samples_for_vertex.extend(
+                                        zip(candidate_radii.tolist(), areas_out.tolist())
+                                    )
+
+                        sample_buffers[int(orig_idx)] = _clean_vertex_samples(_area_samples_for_vertex)
+                        _dt_samples_iter = _time.perf_counter() - _t0
+                        _t_samples += _dt_samples_iter
+
+                        _n_iters += 1
+                        _dt_total_iter = (
+                            _dt_geodesic
+                            + _dt_msd
+                            + _dt_dminmax
+                            + _dt_radius_iter
+                            + _dt_perim_iter
+                            + _dt_samples_iter
                         )
-                    _pbar.update(1)
+                        if verbose:
+                            tqdm.write(
+                                f"[{_n_iters}/{_n_total}] "
+                                f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
+                                f"msd={1000.0 * _dt_msd:.2f}ms "
+                                f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
+                                f"radius={1000.0 * _dt_radius_iter:.2f}ms "
+                                f"perim={1000.0 * _dt_perim_iter:.2f}ms "
+                                f"samples={1000.0 * _dt_samples_iter:.2f}ms "
+                                f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
+                                f"total={1000.0 * _dt_total_iter:.2f}ms"
+                            )
+                        _pbar.update(1)
 
         sample_indptr = np.zeros(self.n_vertices_full + 1, dtype=np.int64)
         for i, row in enumerate(sample_buffers):
