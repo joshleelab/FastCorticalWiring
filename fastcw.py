@@ -177,9 +177,9 @@ def _run_single_surface(
     area_tol,
     eps,
     overwrite,
-    n_samples_between_scales=10,
+    n_samples_between_scales=3,
     boundary_cap_fraction=None,
-    batch_size=32,
+    batch_size=None,
     verbose_timing=False,
     allow_interior_nonmanifold=False,
     sample=None,
@@ -357,12 +357,12 @@ def process_subject(
     surf_type="pial",
     custom_label=None,
     scale=FastCorticalWiringAnalysis.DEFAULT_SCALES,
-    area_tol=0.01,
+    area_tol=None,
     eps=1e-6,
     overwrite=False,
-    n_samples_between_scales=10,
+    n_samples_between_scales=3,
     boundary_cap_fraction=None,
-    batch_size=32,
+    batch_size=None,
     verbose_timing=False,
     allow_interior_nonmanifold=False,
     output_format="auto",
@@ -465,7 +465,7 @@ def run_cli(default_engine="potpourri"):
 
     class _EngineChoiceAction(argparse.Action):
         def __call__(self, parser, namespace, values, option_string=None):
-            valid = {"batch_heat", "potpourri", "potpourri_fmm", "pycortex", "pygeodesic"}
+            valid = {"potpourri", "potpourri_fmm", "pycortex", "pygeodesic"}
             if values not in valid:
                 visible = "potpourri, potpourri_fmm, pycortex, pygeodesic"
                 parser.error(f"argument {option_string}: invalid choice: {values!r} (choose from {visible})")
@@ -493,11 +493,14 @@ def run_cli(default_engine="potpourri"):
     )
     parser.add_argument("--engine-kw", action="append", default=[], help="Engine-specific option as key=value (repeatable)")
     parser.add_argument(
-        "--use-robust",
-        action="store_true",
-        default=False,
-        help="Enable robust heat method mode for potpourri3d distance solver",
+        "--diffusion-length-mm",
+        type=float,
+        default=None,
+        help="Heat-method diffusion length sqrt(t) in mm for the potpourri engine (default: 0.7). "
+             "Fixed in mm so smoothing is identical across meshes and subjects; below 0.5 is rejected.",
     )
+    # Deprecated: robust mode is always on. Accepted (and ignored) so old command lines still run.
+    parser.add_argument("--use-robust", action="store_true", default=False, help=argparse.SUPPRESS)
     parser.add_argument(
         "--allow-eigen-fallback",
         action="store_true",
@@ -537,14 +540,11 @@ def run_cli(default_engine="potpourri"):
         default=list(FastCorticalWiringAnalysis.DEFAULT_SCALES),
         help="One or more scales for local measures as proportions of total area",
     )
-    parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area binary search")
+    # Deprecated: radii are solved exactly. Accepted (and ignored) for old command lines.
+    parser.add_argument("--area-tol", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Number of source vertices per geodesic distance batch (default: 32; use 1 to disable batching)",
-    )
+    # Deprecated: sources are solved one at a time. Accepted (and ignored) for old command lines.
+    parser.add_argument("--batch-size", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--n-samples-between-scales",
         type=int,
@@ -632,19 +632,21 @@ def run_cli(default_engine="potpourri"):
 
     args.sample_vertices = None
     args.output_label = _validate_output_label(args.output_label)
-    if int(args.batch_size) <= 0:
-        raise ValueError("--batch-size must be a positive integer.")
-
     engine_kwargs = parse_engine_kwargs(args.engine_kw)
-    if args.engine == "batch_heat":
-        print(
-            "\n"
-            "WARNING: batch_heat is an experimental hidden engine and is not yet operable.\n"
-            "WARNING: validation shows it is very inaccurate at this time; do not use it for analysis.\n",
-            file=sys.stderr,
-        )
     if args.use_robust:
-        engine_kwargs["use_robust"] = True
+        print("NOTE: --use-robust is deprecated and ignored; potpourri3d always runs in robust mode.")
+    if args.area_tol is not None:
+        print("NOTE: --area-tol is deprecated and ignored; radii are solved exactly.")
+        args.area_tol = None
+    if args.batch_size is not None:
+        print("NOTE: --batch-size is deprecated and ignored; sources are solved one at a time.")
+        args.batch_size = None
+    if args.engine == "potpourri":
+        if ("diffusion_length_mm" in engine_kwargs and args.diffusion_length_mm is not None
+                and float(engine_kwargs["diffusion_length_mm"]) != float(args.diffusion_length_mm)):
+            raise ValueError("Conflicting diffusion lengths from --diffusion-length-mm and --engine-kw.")
+        engine_kwargs.setdefault("diffusion_length_mm", 0.7 if args.diffusion_length_mm is None
+                                 else float(args.diffusion_length_mm))
     if args.allow_eigen_fallback:
         engine_kwargs["allow_eigen_fallback"] = True
     using_explicit_surface = args.surface is not None

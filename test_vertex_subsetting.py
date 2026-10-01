@@ -9,6 +9,7 @@ from unittest import mock
 import numpy as np
 
 import fastcw
+import lean_geometry as lg
 from core_analysis import FastCorticalWiringAnalysis
 from io_utils import load_sampled_pairs, save_analysis_npz
 
@@ -32,11 +33,14 @@ def _dummy_engine_factory(_engine_type, vertices, _faces, _engine_kwargs):
 
 
 class _BatchRecordingDistanceEngine(_DummyDistanceEngine):
-    supports_batching = True
-
     def __init__(self, vertices):
         super().__init__(vertices)
         self.batch_calls = []
+        self.single_calls = []
+
+    def compute_distance(self, source_idx):
+        self.single_calls.append(int(source_idx))
+        return super().compute_distance(source_idx)
 
     def compute_distance_batch(self, source_indices):
         sources = [int(src) for src in source_indices]
@@ -74,26 +78,25 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "line_strip"},
             )
         analysis.boundary_indices = np.asarray([boundary_sub_idx], dtype=np.int32)
-        analysis._perimeter_at_radius = lambda *args, **kwargs: 1.0
-        analysis._area_inside_radius = lambda r, *args, **kwargs: 1000.0 + float(r)
         return analysis
 
     def _run_boundary_cap_case(self, radii, cap):
         analysis = self._make_boundary_cap_analysis()
-        it = iter(float(r) for r in radii)
+        def fake_geometry(*args):
+            args[14][:] = radii
+            args[15][:] = 1.0
+            args[16][:] = np.sqrt(np.asarray(radii[:-1]) * np.asarray(radii[1:]))
+            args[17][:] = 1000.0 + args[16]
+            return 0
 
-        def fake_find_radius(_distances_sub, target_area, **_kwargs):
-            return next(it), 1, []
-
-        analysis._find_radius_for_area = fake_find_radius
         scales = [0.01 * (i + 1) for i in range(len(radii))]
-        analysis.compute_all_wiring_costs(
-            scale=scales,
-            area_tol=0.1,
-            vertex_subset=[0],
-            n_samples_between_scales=1,
-            boundary_cap_fraction=cap,
-        )
+        with mock.patch("core_analysis.lg.per_source_geometry", side_effect=fake_geometry):
+            analysis.compute_all_wiring_costs(
+                scale=scales,
+                vertex_subset=[0],
+                n_samples_between_scales=1,
+                boundary_cap_fraction=cap,
+            )
         sample_radii, sample_areas = analysis.get_vertex_samples(0)
         extras = sample_radii[sample_areas > 900.0]
         return np.asarray(extras, dtype=np.float64)
@@ -126,7 +129,7 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                         boundary_cap_fraction=bad,
                     )
 
-    def test_interior_nonmanifold_auto_enables_potpourri_robust_mode(self):
+    def test_interior_nonmanifold_does_not_change_potpourri_kwargs(self):
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -180,9 +183,9 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "nonmanifold"},
             )
 
-        self.assertTrue(analysis.engine_kwargs["use_robust"])
+        self.assertNotIn("use_robust", analysis.engine_kwargs)
         self.assertEqual(len(engine_calls), 1)
-        self.assertTrue(engine_calls[0]["engine_kwargs"]["use_robust"])
+        self.assertNotIn("use_robust", engine_calls[0]["engine_kwargs"])
 
     def test_compute_all_wiring_costs_respects_vertex_subset(self):
         vertices = np.array(
@@ -208,12 +211,8 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
             )
 
-        analysis._find_radius_for_area = lambda *args, **kwargs: (1.0, 1, [(1.0, 0.2)])
-        analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
-
         analysis.compute_all_wiring_costs(
             scale=0.2,
-            area_tol=0.1,
             vertex_subset=[0, 2, 4, 99, -1],
         )
 
@@ -225,7 +224,7 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             self.assertTrue(np.isfinite(analysis.perimeter_function[scale_key][idx]))
             radii, _areas = analysis.get_vertex_samples(idx)
             self.assertGreaterEqual(len(radii), 1)
-            self.assertTrue(np.any(np.isclose(radii, 1.0)))
+            self.assertTrue(np.any(np.isclose(radii, analysis.radius_function[scale_key][idx])))
 
         for idx in (1, 3, 4):
             self.assertTrue(np.isnan(analysis.msd_unweighted[idx]))
@@ -233,7 +232,7 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             self.assertTrue(np.isnan(analysis.radius_function[scale_key][idx]))
             self.assertTrue(np.isnan(analysis.perimeter_function[scale_key][idx]))
 
-    def test_multiscale_solving_uses_sorted_scales_and_cold_start_bounds(self):
+    def test_multiscale_solving_passes_sorted_targets_once(self):
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -256,31 +255,15 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
             )
 
-        # Keep geometry calls cheap and deterministic for this control-flow test.
-        analysis._perimeter_at_radius = lambda *args, **kwargs: 1.0
+        with mock.patch("core_analysis.lg.per_source_geometry", wraps=lg.per_source_geometry) as solve:
+            analysis.compute_all_wiring_costs(
+                scale=[0.2, 0.05, 0.1],
+                vertex_subset=[0],
+            )
 
-        calls = []
-
-        def fake_find_radius(distances_sub, target_area, **kwargs):
-            calls.append({"target_area": float(target_area), "r_lower": kwargs.get("r_lower")})
-            return float(len(calls)), 1, [(float(len(calls)), float(target_area))]
-
-        analysis._find_radius_for_area = fake_find_radius
-
-        analysis.compute_all_wiring_costs(
-            scale=[0.2, 0.05, 0.1],
-            area_tol=0.1,
-            vertex_subset=[0],
-        )
-
-        self.assertEqual(len(calls), 3)
-        target_areas = [c["target_area"] for c in calls]
-        self.assertEqual(target_areas, sorted(target_areas))
-        self.assertIsNotNone(calls[0]["r_lower"])
-        self.assertIsNotNone(calls[1]["r_lower"])
-        self.assertIsNotNone(calls[2]["r_lower"])
-        self.assertLess(calls[0]["r_lower"], calls[1]["r_lower"])
-        self.assertLess(calls[1]["r_lower"], calls[2]["r_lower"])
+        self.assertEqual(solve.call_count, 1)
+        self.assertEqual(analysis.active_scales, (0.05, 0.1, 0.2))
+        np.testing.assert_allclose(solve.call_args.args[7], np.array([0.05, 0.1, 0.2]))
 
     def test_msd_variants_and_csr_samples_roundtrip(self):
         vertices = np.array(
@@ -331,7 +314,7 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
             finally:
                 loaded.close()
 
-    def test_compute_all_wiring_costs_consumes_distance_batches_in_order(self):
+    def test_compute_all_wiring_costs_solves_sources_one_at_a_time(self):
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -360,20 +343,14 @@ class VertexSubsetAnalysisTests(unittest.TestCase):
                 metadata={"subject_id": "synthetic", "hemi": "lh", "surf_type": "unit_square"},
             )
 
-        analysis._find_radius_for_area = lambda *args, **kwargs: (1.0, 1, [(1.0, 0.2)])
-        analysis._perimeter_at_radius = lambda *args, **kwargs: 2.0
-
         analysis.compute_all_wiring_costs(
             scale=0.2,
-            area_tol=0.1,
             batch_size=2,
             n_samples_between_scales=0,
         )
 
-        expected_batches = [
-            analysis._bfs_order[i : i + 2] for i in range(0, len(analysis._bfs_order), 2)
-        ]
-        self.assertEqual(engine_holder["engine"].batch_calls, expected_batches)
+        self.assertEqual(engine_holder["engine"].single_calls, analysis._bfs_order)
+        self.assertEqual(engine_holder["engine"].batch_calls, [])
 
 
 class _StubAnalysis:

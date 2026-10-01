@@ -61,7 +61,13 @@ def _read_freesurfer_label_mask(label_path, n_vertices):
         cortex_idx = np.asarray(cortex_idx, dtype=np.int64)
 
     valid = (cortex_idx >= 0) & (cortex_idx < cortex_mask.size)
-    cortex_mask[cortex_idx[valid]] = True
+    if not valid.all():
+        raise ValueError(
+            f"{label_path}: {int((~valid).sum())} label indices fall outside this {n_vertices}-vertex "
+            f"surface (max index {int(cortex_idx.max())}); the label belongs to a different mesh. "
+            "Use --no-mask for cortex-only surfaces."
+        )
+    cortex_mask[cortex_idx] = True
     return cortex_mask
 
 
@@ -200,9 +206,20 @@ def load_surface_and_mask(
         metadata["legacy_mode"] = legacy_mode
         metadata["output_basename"] = f"{subject_id}_{hemi}_{surf_type}" if subject_id else infer_output_basename(surface_path)
 
+        cortex_only_surface = ".cortexonly." in os.path.basename(str(surface_path))
+        if cortex_only_surface and not no_mask:
+            if mask_path or custom_label:
+                raise ValueError(
+                    f"{surface_path} is a cortex-only surface; explicit masks or labels do not apply. "
+                    "Remove --mask/--custom-label to use all vertices."
+                )
+            print(f"NOTE: {os.path.basename(str(surface_path))} is cortex-only; using all vertices (no mask).")
+            no_mask = True
+            metadata["mask_source"] = "cortexonly_surface_all_vertices"
+
         if no_mask:
             cortex_mask = np.ones(n_vertices, dtype=bool)
-            metadata["mask_source"] = "all_vertices_no_mask"
+            metadata.setdefault("mask_source", "all_vertices_no_mask")
         elif mask_path:
             mask_ext = os.path.splitext(mask_path)[1].lower()
             if mask_ext == ".label":
@@ -449,6 +466,13 @@ def save_analysis_npz(output_dir, npz_filename, analysis, n_samples_between_scal
             "sub_to_orig": np.asarray(analysis.sub_to_orig, dtype=np.int32),
         }
     )
+    if hasattr(analysis, "field_flag"):
+        payload["field_health_flag"] = np.asarray(analysis.field_flag, dtype=np.uint8)
+    if hasattr(analysis, "provenance"):
+        import json
+
+        payload["fastcw_output_schema_version"] = np.asarray(3, dtype=np.int32)
+        payload["provenance_json"] = np.asarray(json.dumps(analysis.provenance(), sort_keys=True))
     np.savez_compressed(path, **payload)
     return path
 

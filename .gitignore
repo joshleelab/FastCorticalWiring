@@ -3,3 +3,10 @@ __pycache__/
 *.py[cod]
 one_off_scripts/
 logs_fastcw/
+exact_*.npz
+crossmesh_*.npz
+mismatch_case.npz
+screen_flagged_sources.txt
+.venv
+__pycache__/
+*.pyc

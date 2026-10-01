@@ -22,7 +22,10 @@ class EngineCliParsingTests(unittest.TestCase):
         self.assertNotIn("--visualize", text)
         self.assertIn("--scale SCALE [SCALE ...]", text)
         self.assertIn("--allow-eigen-fallback", text)
-        self.assertIn("--batch-size", text)
+        self.assertIn("--diffusion-length-mm", text)
+        self.assertNotIn("--batch-size", text)
+        self.assertNotIn("--area-tol", text)
+        self.assertNotIn("--use-robust", text)
 
     def test_engine_pycortex_is_accepted_by_parser(self):
         proc = subprocess.run(
@@ -33,7 +36,7 @@ class EngineCliParsingTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
 
-    def test_engine_batch_heat_warns_when_invoked_for_real_run(self):
+    def test_engine_batch_heat_is_rejected(self):
         proc = subprocess.run(
             [
                 sys.executable,
@@ -53,17 +56,7 @@ class EngineCliParsingTests(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         text = proc.stdout + proc.stderr
-        self.assertIn("batch_heat is an experimental hidden engine", text)
-        self.assertIn("very inaccurate", text)
-
-    def test_engine_batch_heat_is_accepted_by_parser(self):
-        proc = subprocess.run(
-            [sys.executable, "fastcw.py", "--engine", "batch_heat", "--batch-size", "8", "--help"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 0)
+        self.assertIn("invalid choice", text)
 
     def test_engine_legacy_is_rejected_by_parser(self):
         proc = subprocess.run(

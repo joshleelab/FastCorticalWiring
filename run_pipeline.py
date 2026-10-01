@@ -146,8 +146,13 @@ def build_fastcw_cmd(args, subject):
     if args.output_dir: cmd.extend(["--output-dir", args.output_dir])
     if args.output_format: cmd.extend(["--output-format", args.output_format])
     if args.engine: cmd.extend(["--engine", args.engine])
-    if args.use_robust: cmd.append("--use-robust")
-    if args.batch_size is not None: cmd.extend(["--batch-size", str(args.batch_size)])
+    diffusion_length = 0.7 if args.diffusion_length_mm is None else args.diffusion_length_mm
+    if args.diffusion_length_mm is None:
+        for item in args.engine_kw:
+            key, sep, value = item.partition("=")
+            if sep and key.strip() == "diffusion_length_mm":
+                diffusion_length = float(value)
+    cmd.extend(["--diffusion-length-mm", str(diffusion_length)])
     if args.sample is not None:
         cmd.extend(["--sample", str(args.sample)])
         if args.sample_kind is not None:
@@ -158,7 +163,6 @@ def build_fastcw_cmd(args, subject):
 
     cmd.extend([
         "--scale", *[str(s) for s in args.scale],
-        "--area-tol", str(args.area_tol),
         "--eps", str(args.eps),
         "--n-samples-between-scales", str(args.n_samples_between_scales),
         "--boundary-cap-fraction", "none" if args.boundary_cap_fraction is None else str(args.boundary_cap_fraction),
@@ -208,12 +212,15 @@ def main():
     parser.add_argument("--output-format", default=None, help="Optional FastCW output format override")
     parser.add_argument("--engine", default=None, help="Optional FastCW geodesic engine")
     parser.add_argument(
-        "--use-robust",
-        action="store_true",
-        default=False,
-        help="Enable FastCW robust heat method mode for the potpourri3d distance solver",
+        "--diffusion-length-mm",
+        type=float,
+        default=None,
+        help="Heat-method diffusion length sqrt(t) in mm (potpourri engine; default 0.7)",
     )
-    parser.add_argument("--batch-size", type=int, default=None, help="Optional FastCW geodesic batch size")
+    # Deprecated no-ops, accepted so old command lines still run (robust mode is always on;
+    # sources are solved one at a time; radii are solved exactly).
+    parser.add_argument("--use-robust", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--batch-size", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--force-logical",
         action="store_true",
@@ -258,7 +265,7 @@ def main():
         ],
         help="One or more scales for local measures",
     )
-    parser.add_argument("--area-tol", type=float, default=0.01, help="Relative tolerance for area search")
+    parser.add_argument("--area-tol", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--eps", type=float, default=1e-6, help="Numerical tolerance for isoline tests")
     parser.add_argument(
         "--n-samples-between-scales",
@@ -283,6 +290,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument("--log-dir", default="logs_fastcw", help="Directory for per-subject logs")
     args = parser.parse_args()
+
+    if args.use_robust:
+        print("NOTE: --use-robust is deprecated and ignored; potpourri3d always runs in robust mode.")
+    if args.batch_size is not None:
+        print("NOTE: --batch-size is deprecated and ignored; sources are solved one at a time.")
+    if args.area_tol is not None:
+        print("NOTE: --area-tol is deprecated and ignored; radii are solved exactly.")
 
     Path(args.log_dir).mkdir(exist_ok=True, parents=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(sys.stdout)])

@@ -20,14 +20,22 @@ KEY METRICS COMPUTED:
 
 PERFORMANCE OPTIMIZATIONS:
 - Engine-adapter geodesics on a cortex-only submesh
-- Robust polygon handling for geodesic disc area/perimeter computation
+- Closed-form face geometry for geodesic disc area/perimeter computation
 - Consistent epsilon + vertex-on-isoline handling; APARC -1 exclusion
-- Candidate face filtering for area/perimeter (iso-band only)
+- Distance-bucketed candidate face filtering for area/perimeter
 - Precomputed face geometry/length scales for clipping tolerances
-- BFS vertex ordering + warm-started radius bracketing
-- Required Numba JIT for the face-clipping loops
+- BFS source ordering
+- Required Numba JIT for the closed-form kernels (and legacy clipping kernels)
 
-GEOMETRY OPTIMIZATION NOTE:
+LEAN GEOMETRY (v4):
+compute_all_wiring_costs() uses lean_geometry: closed-form per-face disc area,
+coarea perimeter and exact radius inversion over distance-bucketed faces. The
+clipping/bisection methods below (_area_inside_radius, _perimeter_at_radius,
+_find_radius_for_area, _area_inside_radius_vectorized and their Numba kernels)
+are legacy: no longer used by the main loop, retained for validation scripts.
+Distances come from potpourri3d in robust (intrinsic Delaunay) mode only.
+
+GEOMETRY OPTIMIZATION NOTE (legacy v3):
 The 2026 geometry optimization round changed face-area summation order for
 geodesic disc area estimates. Fully enclosed faces are accumulated in stable
 dmax order through a cumulative-sum lookup, and supplementary samples may use a
@@ -44,6 +52,9 @@ import warnings
 from numba import njit
 
 from distance_engines import create_distance_engine
+import lean_geometry as lg
+
+GEOMETRY_METHOD = "lean_closed_form_v1"
 
 
 def classify_nonmanifold_vertices(vertices, faces):
@@ -615,14 +626,7 @@ class FastCorticalWiringAnalysis:
                 "geodesic distances may be corrupted."
             )
             if self.engine_type == "potpourri":
-                if self.engine_kwargs.get("use_robust", False):
-                    print("Robust potpourri3d mode is already enabled for this surface.")
-                else:
-                    self.engine_kwargs["use_robust"] = True
-                    print(
-                        "Switching this surface to robust potpourri3d mode "
-                        "(use_robust=True)."
-                    )
+                print("potpourri3d always runs in robust (intrinsic Delaunay) mode.")
             elif not self.allow_interior_nonmanifold:
                 warnings.warn(
                     "Interior non-manifold vertices detected in cortical submesh. "
@@ -687,6 +691,21 @@ class FastCorticalWiringAnalysis:
         self.vertex_areas = np.zeros(self.n_vertices_full, dtype=np.float64)  # Areas in full mesh
         self.vertex_areas[self.sub_to_orig] = self.vertex_areas_sub
         
+        # Lean geometry state (per-face metric, bucket width, scratch buffers reused per source)
+        (
+            self._lean_area,
+            self._lean_g11,
+            self._lean_g12,
+            self._lean_g22,
+        ) = lg.precompute_face_metric(self.vertices, self.faces)
+        self._lean_width = lg.default_bin_width(self.vertices, self.faces)
+        self._lean_dmax = np.empty(self.n_faces, dtype=np.float64)
+        self._lean_order = np.empty(self.n_faces, dtype=np.int32)
+        self._lean_long = np.empty(self.n_faces, dtype=np.int32)
+        self._health_h = float(np.median(self.face_L))
+        self.field_flag = np.zeros(self.n_vertices_full, dtype=np.uint8)
+        self.n_flagged_fields = 0
+
         # Initialize result arrays (will be filled by computation methods)
         self.msd_unweighted = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
         self.msd_weighted = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
@@ -989,27 +1008,6 @@ class FastCorticalWiringAnalysis:
         """
         d = self.distance_engine.compute_distance(int(sub_idx))
         return np.ascontiguousarray(d, dtype=np.float64)
-
-    def _compute_geodesic_distance_batch_from_subvertices(self, sub_indices):
-        """
-        Compute geodesic distances from multiple submesh vertices.
-
-        Returns an array with shape (n_submesh_vertices, n_sources).
-        """
-        sources = np.asarray(list(sub_indices), dtype=np.int64).reshape(-1)
-        if sources.size == 0:
-            return np.empty((self.n_vertices, 0), dtype=np.float64)
-        if getattr(self.distance_engine, "supports_batching", False):
-            d_batch = self.distance_engine.compute_distance_batch(sources)
-        else:
-            d_batch = np.column_stack(
-                [self.distance_engine.compute_distance(int(src)) for src in sources]
-            )
-        d_batch = np.asarray(d_batch, dtype=np.float64)
-        expected = (self.n_vertices, int(sources.size))
-        if d_batch.shape != expected:
-            raise ValueError(f"Geodesic batch returned shape {d_batch.shape}; expected {expected}.")
-        return np.ascontiguousarray(d_batch, dtype=np.float64)
 
     def compute_geodesic_distances_from_vertex(self, source_idx):
         """
@@ -1423,50 +1421,66 @@ class FastCorticalWiringAnalysis:
     # ========================================================================
 
 
+    @staticmethod
+    def _clean_vertex_samples(samples):
+        """Sort (radius, area) pairs by radius and drop near-duplicate radii."""
+        if not samples:
+            return []
+        arr = np.asarray(samples, dtype=np.float64)
+        arr = arr[np.argsort(arr[:, 0], kind="stable")]
+        if arr.shape[0] == 1:
+            return [(float(arr[0, 0]), float(arr[0, 1]))]
+        r = arr[:, 0]
+        tol = max(1e-12, 1e-9 * float(r[-1] - r[0]))
+        keep = np.empty(arr.shape[0], dtype=bool)
+        keep[0] = True
+        keep[1:] = np.diff(r) > tol
+        arr = arr[keep]
+        return [(float(a0), float(a1)) for a0, a1 in arr]
+
     def compute_all_wiring_costs(
         self,
         scale=None,
-        area_tol=0.01,
+        area_tol=None,
         vertex_subset=None,
-        n_samples_between_scales=10,
+        n_samples_between_scales=3,
         boundary_cap_fraction=None,
-        batch_size=32,
+        batch_size=None,
         verbose=False,
     ):
         """
-        Compute all wiring cost metrics (MSD, radius, perimeter) in a single pass.
+        Compute MSD, radius, perimeter and (radius, area) samples in one pass per source.
 
-        This optimized method iterates through each cortical vertex only once. In each
-        iteration, it computes the geodesic distance vector and then calculates all
-        derived metrics (MSD, radius, perimeter) from that vector before discarding it.
-        This avoids re-computing the expensive geodesic distances in separate loops.
+        For each cortical source vertex: one geodesic solve, a health screen of
+        the distance field, MSD and distance-to-boundary, then lean_geometry
+        solves every scale's radius exactly (no bisection tolerance), evaluates
+        the perimeter by the coarea formula, and evaluates supplementary
+        (radius, area) samples.
 
         Args:
-            scale: Single scale or iterable of scales as proportions of total cortical area.
-            area_tol (float): Relative tolerance for the area binary search.
-            vertex_subset: Optional iterable of original vertex indices to compute.
-            n_samples_between_scales: Number of supplementary log-spaced area samples
-                between adjacent solved target-scale radii. Use 0 for bisection
-                history only; values above ~5 increase storage with diminishing returns.
-            boundary_cap_fraction: Optional maximum estimated fraction of a
-                supplementary sample's disc area clipped by a locally straight
-                boundary. None means no cap; 0.0 rejects supplementary discs
-                as soon as they cross the boundary; values must be in [0, 0.5).
-                This uses closed-form Euclidean circular-segment geometry and
-                assumes a locally planar boundary and locally Euclidean disc.
-                On highly curved cortex, true area loss may differ by O(K*r^2),
-                where K is local Gaussian curvature; the dominant error in
-                those regimes is curvature correction to area = pi*r^2, not
-                the segment geometry. The cap applies only to supplementary
-                samples; converged target-scale radii are always retained.
-            batch_size: Number of source vertices per geodesic batch. Values <= 1
-                force single-source batches.
-            verbose: Emit per-vertex timing lines in addition to the end-of-run summary.
+            scale: Single scale or iterable of scales (fractions of cortical area).
+            area_tol: Deprecated and ignored; radii are solved exactly.
+            vertex_subset: Optional iterable of original vertex indices.
+            n_samples_between_scales: Supplementary log-spaced samples between
+                adjacent solved radii (0 disables).
+            boundary_cap_fraction: Optional cap in [0, 0.5) on the estimated
+                boundary-clipped disc-area fraction of supplementary samples.
+                Solved target-scale samples are always kept.
+            batch_size: Deprecated and ignored (sources are solved one at a time).
+            verbose: Emit per-vertex timing lines.
+
+        Sources whose distance field fails lean_geometry.field_health are
+        written as NaN for every metric, flagged in self.field_flag, and
+        reported in a warning at the end of the run.
         """
+        import time as _time
+
         scales = self.normalize_scales(scale)
-        batch_size = int(batch_size)
-        if batch_size <= 0:
-            raise ValueError("batch_size must be a positive integer.")
+        if area_tol is not None:
+            print("NOTE: area_tol is ignored; radii are solved exactly.")
+        if batch_size not in (None, 1):
+            warnings.warn("batch_size is deprecated and ignored; sources are solved one at a time.",
+                          DeprecationWarning)
         n_samples_between_scales = int(n_samples_between_scales)
         if n_samples_between_scales < 0:
             raise ValueError("n_samples_between_scales must be >= 0.")
@@ -1486,46 +1500,23 @@ class FastCorticalWiringAnalysis:
         self.msd_unweighted[:] = np.nan
         self.msd_weighted[:] = np.nan
         self.dist_to_boundary = np.full(self.n_vertices_full, np.nan, dtype=np.float32)
-        self.radius_function = {
-            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
-        }
-        self.perimeter_function = {
-            float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales
-        }
+        self.radius_function = {float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales}
+        self.perimeter_function = {float(s): np.full(self.n_vertices_full, np.nan, dtype=np.float32) for s in scales}
+        self.field_flag[:] = 0
+        self.n_flagged_fields = 0
         self.sample_radii_flat = None
         self.sample_areas_flat = None
         self.sample_indptr = None
         sample_buffers = [None] * self.n_vertices_full
 
-        def _clean_vertex_samples(samples):
-            if not samples:
-                return []
-            arr = np.asarray(samples, dtype=np.float64)
-            order = np.argsort(arr[:, 0], kind='stable')
-            arr = arr[order]
-            if arr.shape[0] == 1:
-                return [(float(arr[0, 0]), float(arr[0, 1]))]
-            r = arr[:, 0]
-            total_range = float(r[-1] - r[0])
-            tol = max(1e-12, 1e-9 * total_range)
-            keep = np.empty(arr.shape[0], dtype=bool)
-            keep[0] = True
-            keep[1:] = np.diff(r) > tol
-            arr = arr[keep]
-            return [(float(arr[i, 0]), float(arr[i, 1])) for i in range(arr.shape[0])]
-
-        print("Computing Mean Separation Distances and Local Wiring Costs...")
-
-        # Calculate target area once for local measures
+        print("Computing Mean Separation Distances and Local Wiring Costs (lean geometry)...")
         total_area = float(np.sum(self.vertex_areas_sub))
-        target_areas = {float(s): total_area * float(s) for s in scales}
+        targets = np.array([total_area * float(s) for s in scales], dtype=np.float64)
         print("Target areas for local measures:")
-        for s in scales:
-            target_area = target_areas[float(s)]
-            print(f"  - {s*100:.2f}%: {target_area:.2f} mm² of {total_area:.2f} mm²")
+        for s, t in zip(scales, targets):
+            print(f"  - {s*100:.2f}%: {t:.2f} mm² of {total_area:.2f} mm²")
 
         order_sub = list(self._bfs_order)
-        adj = self._adj
         if vertex_subset is not None:
             subset_sub_set = set()
             for raw_idx in vertex_subset:
@@ -1533,9 +1524,7 @@ class FastCorticalWiringAnalysis:
                     orig_idx = int(raw_idx)
                 except Exception:
                     continue
-                if orig_idx < 0 or orig_idx >= self.n_vertices_full:
-                    continue
-                if not self.cortex_mask_full[orig_idx]:
+                if orig_idx < 0 or orig_idx >= self.n_vertices_full or not self.cortex_mask_full[orig_idx]:
                     continue
                 sub_idx = int(self.orig_to_sub[orig_idx])
                 if sub_idx >= 0:
@@ -1543,340 +1532,160 @@ class FastCorticalWiringAnalysis:
             order_sub = [v for v in order_sub if v in subset_sub_set]
             print(f"Restricting computation to {len(order_sub)} specified vertices.")
 
-        r_sub_by_scale = {float(s): np.full(self.n_vertices, np.nan, dtype=np.float32) for s in scales}
-        r_euclid_by_scale = {
-            float(s): (float(np.sqrt(target_areas[float(s)] / np.pi)) if target_areas[float(s)] > 0 else 0.0)
-            for s in scales
-        }
+        m = n_samples_between_scales
+        extra_fracs = np.arange(1, m + 1, dtype=np.float64) / (m + 1.0)
+        n_extra = max(0, len(scales) - 1) * m
+        radii_out = np.empty(len(scales), dtype=np.float64)
+        perim_out = np.empty(len(scales), dtype=np.float64)
+        extra_r = np.empty(n_extra, dtype=np.float64)
+        extra_a = np.empty(n_extra, dtype=np.float64)
 
-        import time as _time
+        t_geo = t_msd = t_geom = t_samples = 0.0
+        n_done = 0
+        n_eval_total = 0
+        flagged = []
 
-        _t_geodesic = 0.0
-        _t_msd      = 0.0
-        _t_dminmax  = 0.0
-        _t_radius   = 0.0
-        _t_perim    = 0.0
-        _t_samples  = 0.0
-        _n_iters    = 0
-        _n_total    = len(order_sub)
-        _n_batches  = 0
-        _sum_batch_width = 0
-
-        # Batched geodesic loop over cortical vertices (BFS order for warm-start locality).
-        with tqdm(total=_n_total, desc="Computing wiring costs") as _pbar:
+        with tqdm(total=len(order_sub), desc="Computing wiring costs") as pbar:
             with np.errstate(invalid='ignore', divide='ignore'):
-                for batch_start in range(0, _n_total, batch_size):
-                    batch_indices = order_sub[batch_start : batch_start + batch_size]
-                    if not batch_indices:
+                for sub_idx in order_sub:
+                    orig_idx = int(self.sub_to_orig[sub_idx])
+
+                    t0 = _time.perf_counter()
+                    d_sub = self._compute_geodesic_distances_from_subvertex(sub_idx)
+                    dt_geo = _time.perf_counter() - t0
+                    t_geo += dt_geo
+
+                    neg, viol, bad = lg.field_health(d_sub, self.vertices, sub_idx, self._health_h)
+                    if bad:
+                        self.field_flag[orig_idx] = 1
+                        flagged.append((orig_idx, neg, viol))
+                        n_done += 1
+                        pbar.update(1)
                         continue
-                    _n_batches += 1
-                    _sum_batch_width += len(batch_indices)
 
-                    # --- Phase 1: Geodesic solve for this batch ---
-                    _t0 = _time.perf_counter()
-                    d_batch = self._compute_geodesic_distance_batch_from_subvertices(batch_indices)
-                    _dt_geodesic_batch = _time.perf_counter() - _t0
-                    _t_geodesic += _dt_geodesic_batch
-                    _dt_geodesic_per_source = _dt_geodesic_batch / float(len(batch_indices))
-
-                    for batch_col, sub_idx in enumerate(batch_indices):
-                        d_sub = np.ascontiguousarray(d_batch[:, batch_col], dtype=np.float64)
-                        _dt_geodesic = _dt_geodesic_per_source
-
-                        orig_idx = self.sub_to_orig[sub_idx]
-
-                        if self.boundary_indices.size:
-                            b_dists = d_sub[self.boundary_indices]
-                            b_finite = b_dists[np.isfinite(b_dists)]
-                            min_b_dist = float(np.min(b_finite)) if b_finite.size else np.nan
-                        else:
-                            min_b_dist = np.inf
-                        self.dist_to_boundary[orig_idx] = np.float32(min_b_dist)
-
-                        # --- Phase 2: MSD ---
-                        _t0 = _time.perf_counter()
-                        valid = (d_sub > self.eps) & np.isfinite(d_sub)
-                        if np.any(valid):
-                            d_valid = d_sub[valid]
-                            w = self.vertex_areas_sub[valid]
-                            wsum = float(np.sum(w))
-                            msd_unweighted_val = float(np.mean(d_valid))
-                            if np.isfinite(wsum) and wsum > 0.0:
-                                msd_weighted_val = float((d_valid * w).sum() / wsum)
-                            else:
-                                msd_weighted_val = np.nan
-                        else:
-                            msd_unweighted_val = np.nan
-                            msd_weighted_val = np.nan
-                        self.msd_unweighted[orig_idx] = np.float32(msd_unweighted_val)
-                        self.msd_weighted[orig_idx] = np.float32(msd_weighted_val)
-                        _dt_msd = _time.perf_counter() - _t0
-                        _t_msd += _dt_msd
-
-                        # --- Phase 3: dmin/dmax buffers ---
-                        _t0 = _time.perf_counter()
-                        np.take(d_sub, self._f0, out=self._d0_buf)
-                        np.take(d_sub, self._f1, out=self._d1_buf)
-                        np.take(d_sub, self._f2, out=self._d2_buf)
-                        np.minimum(self._d0_buf, self._d1_buf, out=self._dmin_buf)
-                        np.minimum(self._dmin_buf, self._d2_buf, out=self._dmin_buf)
-                        np.maximum(self._d0_buf, self._d1_buf, out=self._dmax_buf)
-                        np.maximum(self._dmax_buf, self._d2_buf, out=self._dmax_buf)
-                        dmax_order = np.argsort(self._dmax_buf, kind='stable')
-                        sorted_dmax = self._dmax_buf[dmax_order]
-                        cumulative_inside_area = np.concatenate(
-                            ([0.0], np.cumsum(self.face_areas[dmax_order]))
+                    t0 = _time.perf_counter()
+                    if self.boundary_indices.size:
+                        b_d = d_sub[self.boundary_indices]
+                        b_d = b_d[np.isfinite(b_d)]
+                        self.dist_to_boundary[orig_idx] = np.float32(np.min(b_d)) if b_d.size else np.nan
+                    else:
+                        self.dist_to_boundary[orig_idx] = np.float32(np.inf)
+                    valid = (d_sub > self.eps) & np.isfinite(d_sub)
+                    if np.any(valid):
+                        d_valid = d_sub[valid]
+                        w = self.vertex_areas_sub[valid]
+                        wsum = float(np.sum(w))
+                        self.msd_unweighted[orig_idx] = np.float32(np.mean(d_valid))
+                        self.msd_weighted[orig_idx] = np.float32(
+                            float((d_valid * w).sum() / wsum) if np.isfinite(wsum) and wsum > 0.0 else np.nan
                         )
-                        _dt_dminmax = _time.perf_counter() - _t0
-                        _t_dminmax += _dt_dminmax
+                    dt_msd = _time.perf_counter() - t0
+                    t_msd += dt_msd
 
-                        # --- Phase 4 & 5: Radius bisection and perimeter (per scale) ---
-                        r_prev_scale = np.nan
-                        _is_first_vertex = (_n_iters == 0)
-                        _dt_radius_iter = 0.0
-                        _dt_perim_iter = 0.0
-                        _bisection_iters_by_scale = []
-                        _area_samples_for_vertex = []
-                        for s in scales:
-                            scale_key = float(s)
-                            r_sub = r_sub_by_scale[scale_key]
-                            solved_neighbor_r = [float(r_sub[u]) for u in adj[sub_idx] if np.isfinite(r_sub[u])]
+                    t0 = _time.perf_counter()
+                    n_eval = lg.per_source_geometry(
+                        d_sub, self.faces, self._lean_area, self._lean_g11, self._lean_g12, self._lean_g22,
+                        self._lean_width, targets, extra_fracs, 1e-10, 60,
+                        self._lean_dmax, self._lean_order, self._lean_long,
+                        radii_out, perim_out, extra_r, extra_a,
+                    )
+                    n_eval_total += int(n_eval)
+                    for i, s in enumerate(scales):
+                        self.radius_function[float(s)][orig_idx] = np.float32(radii_out[i])
+                        self.perimeter_function[float(s)][orig_idx] = np.float32(perim_out[i])
+                    dt_geom = _time.perf_counter() - t0
+                    t_geom += dt_geom
 
-                            neighbor_lower = None
-                            neighbor_upper = None
-                            if solved_neighbor_r:
-                                neighbors = np.asarray(solved_neighbor_r, dtype=np.float64)
-                                neighbor_eps = max(self.eps * 10.0, 1e-6)
-                                neighbor_lower = max(0.0, float(np.min(neighbors)) - neighbor_eps)
-                                neighbor_upper = float(np.max(neighbors)) + neighbor_eps
-                                r_init = 0.5 * (neighbor_lower + neighbor_upper)
-                                _neighbor_range = float(np.max(neighbors)) - float(np.min(neighbors))
-                            else:
-                                r_init = r_euclid_by_scale[scale_key]
-                                _neighbor_range = 0.0
+                    t0 = _time.perf_counter()
+                    pairs = [(float(r), float(a)) for r, a in zip(radii_out, targets) if np.isfinite(r)]
+                    if n_extra:
+                        ok = np.isfinite(extra_r) & np.isfinite(extra_a)
+                        if boundary_cap_value is not None:
+                            d_b = float(self.dist_to_boundary[orig_idx])
+                            for j in np.flatnonzero(ok):
+                                if self.boundary_area_loss_fraction(float(extra_r[j]), d_b) > boundary_cap_value:
+                                    ok[j] = False
+                        pairs.extend(zip(extra_r[ok].tolist(), extra_a[ok].tolist()))
+                    sample_buffers[orig_idx] = self._clean_vertex_samples(pairs)
+                    dt_samples = _time.perf_counter() - t0
+                    t_samples += dt_samples
 
-                            if np.isfinite(r_prev_scale):
-                                if neighbor_lower is None:
-                                    r_lower = float(r_prev_scale)
-                                else:
-                                    r_lower = max(neighbor_lower, float(r_prev_scale))
-                            else:
-                                r_lower = neighbor_lower
-                            r_upper = neighbor_upper
-
-                            _t0 = _time.perf_counter()
-                            if _is_first_vertex:
-                                _cold_r_euclid = r_euclid_by_scale[scale_key]
-                                _cold_delta0 = 0.4 * _cold_r_euclid
-                                _r_out = self._find_radius_for_area(
-                                    d_sub,
-                                    target_areas[scale_key],
-                                    tol=area_tol,
-                                    dmin=self._dmin_buf,
-                                    dmax=self._dmax_buf,
-                                    r_init=_cold_r_euclid,
-                                    r_lower=max(0.0, _cold_r_euclid - _cold_delta0),
-                                    r_upper=_cold_r_euclid + _cold_delta0,
-                                    delta0=_cold_delta0,
-                                    max_iter=50,
-                                    sorted_dmax=sorted_dmax,
-                                    cumulative_inside_area=cumulative_inside_area,
-                                )
-                            else:
-                                _r_out = self._find_radius_for_area(
-                                    d_sub,
-                                    target_areas[scale_key],
-                                    tol=area_tol,
-                                    dmin=self._dmin_buf,
-                                    dmax=self._dmax_buf,
-                                    r_init=r_init,
-                                    r_lower=r_lower,
-                                    r_upper=r_upper,
-                                    neighbor_range=_neighbor_range,
-                                    r_euclid=r_euclid_by_scale[scale_key],
-                                    sorted_dmax=sorted_dmax,
-                                    cumulative_inside_area=cumulative_inside_area,
-                                )
-                            r, _bcount, _history = _r_out
-                            _dt_radius = _time.perf_counter() - _t0
-                            _t_radius += _dt_radius
-                            _dt_radius_iter += _dt_radius
-                            if _history:
-                                _area_samples_for_vertex.extend(_history)
-                            if not np.isfinite(r):
-                                _bisection_iters_by_scale.append(0)
-                                r_sub[sub_idx] = np.nan
-                                self.radius_function[scale_key][orig_idx] = np.nan
-                                self.perimeter_function[scale_key][orig_idx] = np.nan
-                                continue
-
-                            _bisection_iters_by_scale.append(int(_bcount))
-                            r_prev_scale = float(r)
-                            _area_samples_for_vertex.append((float(r), float(target_areas[scale_key])))
-
-                            _t0 = _time.perf_counter()
-                            perim = self._perimeter_at_radius(
-                                r,
-                                d_sub,
-                                dmin=self._dmin_buf,
-                                dmax=self._dmax_buf,
-                                sorted_dmax=sorted_dmax,
-                                cumulative_inside_area=cumulative_inside_area,
-                            )
-                            _dt_perim = _time.perf_counter() - _t0
-                            _t_perim += _dt_perim
-                            _dt_perim_iter += _dt_perim
-
-                            r_sub[sub_idx] = np.float32(r)
-                            self.radius_function[scale_key][orig_idx] = np.float32(r)
-                            self.perimeter_function[scale_key][orig_idx] = np.float32(perim)
-
-                        _t0 = _time.perf_counter()
-                        d_b_for_cap = None if boundary_cap_value is None else float(self.dist_to_boundary[orig_idx])
-                        if n_samples_between_scales > 0:
-                            solved_radii_for_vertex = [float(r_sub_by_scale[float(s)][sub_idx]) for s in scales]
-                            candidate_radii = []
-                            for i in range(len(solved_radii_for_vertex) - 1):
-                                r_lo = solved_radii_for_vertex[i]
-                                r_hi = solved_radii_for_vertex[i + 1]
-                                if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_hi > r_lo and r_lo > 0.0):
-                                    continue
-                                extra_rs = np.exp(
-                                    np.linspace(
-                                        np.log(r_lo),
-                                        np.log(r_hi),
-                                        n_samples_between_scales + 2,
-                                    )
-                                )[1:-1]
-                                candidate_radii.extend(extra_rs.tolist())
-
-                            if candidate_radii:
-                                candidate_radii = np.asarray(candidate_radii, dtype=np.float64)
-                                if boundary_cap_value is not None:
-                                    keep = np.array([
-                                        self.boundary_area_loss_fraction(float(r), d_b_for_cap) <= boundary_cap_value
-                                        for r in candidate_radii
-                                    ])
-                                    candidate_radii = candidate_radii[keep]
-                                if candidate_radii.size:
-                                    candidate_radii = np.sort(candidate_radii)
-                                    areas_out = self._area_inside_radius_vectorized(
-                                        candidate_radii,
-                                        d_sub,
-                                        dmin=self._dmin_buf,
-                                        dmax=self._dmax_buf,
-                                    )
-                                    _area_samples_for_vertex.extend(
-                                        zip(candidate_radii.tolist(), areas_out.tolist())
-                                    )
-
-                        sample_buffers[int(orig_idx)] = _clean_vertex_samples(_area_samples_for_vertex)
-                        _dt_samples_iter = _time.perf_counter() - _t0
-                        _t_samples += _dt_samples_iter
-
-                        _n_iters += 1
-                        _dt_total_iter = (
-                            _dt_geodesic
-                            + _dt_msd
-                            + _dt_dminmax
-                            + _dt_radius_iter
-                            + _dt_perim_iter
-                            + _dt_samples_iter
+                    n_done += 1
+                    if verbose:
+                        tqdm.write(
+                            f"[{n_done}/{len(order_sub)}] geodesic={1e3 * dt_geo:.2f}ms msd={1e3 * dt_msd:.2f}ms "
+                            f"geometry={1e3 * dt_geom:.2f}ms ({n_eval} band evals) samples={1e3 * dt_samples:.2f}ms"
                         )
-                        if verbose:
-                            tqdm.write(
-                                f"[{_n_iters}/{_n_total}] "
-                                f"geodesic={1000.0 * _dt_geodesic:.2f}ms "
-                                f"msd={1000.0 * _dt_msd:.2f}ms "
-                                f"dminmax={1000.0 * _dt_dminmax:.2f}ms "
-                                f"radius={1000.0 * _dt_radius_iter:.2f}ms "
-                                f"perim={1000.0 * _dt_perim_iter:.2f}ms "
-                                f"samples={1000.0 * _dt_samples_iter:.2f}ms "
-                                f"bisection_iters={'+'.join(str(x) for x in _bisection_iters_by_scale)} "
-                                f"total={1000.0 * _dt_total_iter:.2f}ms"
-                            )
-                        _pbar.update(1)
+                    pbar.update(1)
 
         sample_indptr = np.zeros(self.n_vertices_full + 1, dtype=np.int64)
         for i, row in enumerate(sample_buffers):
             sample_indptr[i + 1] = sample_indptr[i] + (0 if row is None else len(row))
         total_samples = int(sample_indptr[-1])
-        sample_radii_flat = np.empty(total_samples, dtype=np.float32)
-        sample_areas_flat = np.empty(total_samples, dtype=np.float32)
+        self.sample_radii_flat = np.empty(total_samples, dtype=np.float32)
+        self.sample_areas_flat = np.empty(total_samples, dtype=np.float32)
         for i, row in enumerate(sample_buffers):
-            if not row:
-                continue
-            lo = int(sample_indptr[i])
-            hi = int(sample_indptr[i + 1])
-            sample_radii_flat[lo:hi] = np.asarray([x[0] for x in row], dtype=np.float32)
-            sample_areas_flat[lo:hi] = np.asarray([x[1] for x in row], dtype=np.float32)
-        self.sample_radii_flat = sample_radii_flat
-        self.sample_areas_flat = sample_areas_flat
+            if row:
+                lo, hi = int(sample_indptr[i]), int(sample_indptr[i + 1])
+                self.sample_radii_flat[lo:hi] = np.asarray([x[0] for x in row], dtype=np.float32)
+                self.sample_areas_flat[lo:hi] = np.asarray([x[1] for x in row], dtype=np.float32)
         self.sample_indptr = sample_indptr
 
-        _t_total = (
-            _t_geodesic
-            + _t_msd
-            + _t_dminmax
-            + _t_radius
-            + _t_perim
-            + _t_samples
-        )
-        if _t_total > 0 and _n_iters > 0:
-            _per = lambda t: f"{t:.1f}s ({100.0 * t / _t_total:.1f}%)"
-            _avg_batch_width = (_sum_batch_width / _n_batches) if _n_batches else 0.0
-            _timing_lines = [
-                f"Timing breakdown over {_n_iters} vertices:",
-                f"  geodesic solve : {_per(_t_geodesic)}",
-                f"  geodesic batch : avg K={_avg_batch_width:.1f}, {1000.0 * _t_geodesic / _n_iters:.2f} ms/vertex",
-                f"  MSD            : {_per(_t_msd)}",
-                f"  dmin/dmax      : {_per(_t_dminmax)}",
-                f"  radius bisect  : {_per(_t_radius)}  [{len(scales)} scales]",
-                f"  perimeter      : {_per(_t_perim)}  [{len(scales)} scales]",
-                f"  samples        : {_per(_t_samples)}",
-                f"  total          : {_t_total:.1f}s",
-                f"  per vertex     : {1000.0 * _t_total / _n_iters:.2f} ms/vertex",
-                f"  geodesic frac  : {100.0 * _t_geodesic / _t_total:.1f}%",
-                f"  geometry frac  : {100.0 * (_t_msd + _t_dminmax + _t_radius + _t_perim + _t_samples) / _t_total:.1f}%",
-            ]
-            for line in _timing_lines:
-                print(line)
+        self.n_flagged_fields = len(flagged)
+        if flagged:
+            msg = (f"{len(flagged)} of {n_done} source vertices had corrupted distance fields; "
+                   "all metrics for them were set to NaN (see field_flag).")
+            warnings.warn(msg, RuntimeWarning)
+            print("WARNING: " + msg)
+            for orig_idx, neg, viol in flagged[:10]:
+                print(f"  vertex {orig_idx}: negative fraction {neg:.4f}, chord-violation fraction {viol:.4f}")
 
-        # Print summary statistics at the end
-        valid_msd_unweighted = self.msd_unweighted[np.isfinite(self.msd_unweighted)]
-        if valid_msd_unweighted.size:
+        t_total = t_geo + t_msd + t_geom + t_samples
+        n_ok = n_done - len(flagged)
+        if t_total > 0 and n_done > 0:
+            per = lambda t: f"{t:.1f}s ({100.0 * t / t_total:.1f}%)"
+            print(f"Timing breakdown over {n_done} vertices:")
+            print(f"  geodesic solve : {per(t_geo)}")
+            print(f"  MSD/boundary   : {per(t_msd)}")
+            print(f"  lean geometry  : {per(t_geom)}  [{len(scales)} scales, "
+                  f"{n_eval_total / max(1, n_ok):.0f} band evals/vertex]")
+            print(f"  samples        : {per(t_samples)}")
+            print(f"  total          : {t_total:.1f}s ({1000.0 * t_total / n_done:.2f} ms/vertex)")
+
+        valid_u = self.msd_unweighted[np.isfinite(self.msd_unweighted)]
+        if valid_u.size:
             print("MSD (unweighted, Ecker 2013 definition):")
-            print(
-                f"  min={np.min(valid_msd_unweighted):.2f}, "
-                f"max={np.max(valid_msd_unweighted):.2f}, "
-                f"mean={np.mean(valid_msd_unweighted):.2f}"
-            )
-        valid_msd_weighted = self.msd_weighted[np.isfinite(self.msd_weighted)]
-        if valid_msd_weighted.size:
+            print(f"  min={np.min(valid_u):.2f}, max={np.max(valid_u):.2f}, mean={np.mean(valid_u):.2f}")
+        valid_w = self.msd_weighted[np.isfinite(self.msd_weighted)]
+        if valid_w.size:
             print("MSD (area-weighted, resampling-invariant):")
-            print(
-                f"  min={np.min(valid_msd_weighted):.2f}, "
-                f"max={np.max(valid_msd_weighted):.2f}, "
-                f"mean={np.mean(valid_msd_weighted):.2f}"
-            )
-
+            print(f"  min={np.min(valid_w):.2f}, max={np.max(valid_w):.2f}, mean={np.mean(valid_w):.2f}")
         for s in scales:
-            scale_key = float(s)
-            vr = self.radius_function[scale_key][np.isfinite(self.radius_function[scale_key])]
-            vp = self.perimeter_function[scale_key][np.isfinite(self.perimeter_function[scale_key])]
+            vr = self.radius_function[float(s)]
+            vp = self.perimeter_function[float(s)]
+            vr, vp = vr[np.isfinite(vr)], vp[np.isfinite(vp)]
             if vr.size:
-                print(
-                    f"Radius stats @ {s*100:.2f}%: "
-                    f"min={np.min(vr):.2f}, max={np.max(vr):.2f}, mean={np.mean(vr):.2f}"
-                )
+                print(f"Radius stats @ {s*100:.2f}%: min={np.min(vr):.2f}, max={np.max(vr):.2f}, mean={np.mean(vr):.2f}")
             if vp.size:
-                print(
-                    f"Perimeter stats @ {s*100:.2f}%: "
-                    f"min={np.min(vp):.2f}, max={np.max(vp):.2f}, mean={np.mean(vp):.2f}"
-                )
+                print(f"Perimeter stats @ {s*100:.2f}%: min={np.min(vp):.2f}, max={np.max(vp):.2f}, mean={np.mean(vp):.2f}")
 
         return (self.msd_unweighted, self.msd_weighted), self.radius_function, self.perimeter_function
-            
+
+    def provenance(self):
+        """Method and solver settings to record alongside outputs."""
+        eng = self.distance_engine
+        return {
+            "geometry_method": GEOMETRY_METHOD,
+            "engine": getattr(eng, "name", str(self.engine_type)),
+            "use_robust": getattr(eng, "use_robust", None),
+            "diffusion_length_mm": getattr(eng, "diffusion_length_mm", None),
+            "t_coef": getattr(eng, "t_coef", None),
+            "mean_edge_length_mm": getattr(eng, "mean_edge_length", None),
+            "n_flagged_fields": int(self.n_flagged_fields),
+            "health_neg_frac_tol": 1e-3,
+            "health_chord_frac_tol": 1e-3,
+        }
+
     # ========================================================================
     # INPUT/OUTPUT
     # ========================================================================

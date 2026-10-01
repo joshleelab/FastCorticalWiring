@@ -8,7 +8,7 @@ High-performance Python tools for computing intrinsic cortical wiring metrics fr
 
 ## Important: SuiteSparse/CHOLMOD Build Prerequisites
 
-`potpourri3d` performs best when built against SuiteSparse, and the `batch_heat` engine requires CHOLMOD through `scikit-sparse`. Install build prerequisites before installing Python dependencies:
+`potpourri3d` performs best when built against SuiteSparse. Install build prerequisites before installing Python dependencies:
 
 - macOS (Homebrew): `brew install suitesparse`
 - Ubuntu/Debian: `apt-get install cmake libsuitesparse-dev`
@@ -52,7 +52,7 @@ This package computes intrinsic wiring metrics at each cortical vertex:
   Geodesic distance from each vertex to the nearest physical submesh boundary, useful for filtering large-radius finite-size effects.
 
 * **Sampled Radius/Area Pairs**
-  Bisection and supplementary `(radius, area)` samples are saved so downstream scale-law fitting can be redone without rerunning geodesics.
+  Solved and supplementary `(radius, area)` samples are saved so downstream scale-law fitting can be redone without rerunning geodesics.
 
 These metrics provide quantitative descriptions of cortical spatial organization and intrinsic wiring constraints.
 
@@ -65,7 +65,6 @@ These metrics provide quantitative descriptions of cortical spatial organization
 Uses pluggable geodesic backends:
 
 * `potpourri3d` (primary backend, recommended)
-* `batch_heat` (batched heat-method backend using robust-laplacian + CHOLMOD)
 * `pygeodesic` (exact discrete-geodesic reference backend)
 * `pycortex` (alternate backend)
 
@@ -80,7 +79,7 @@ Typical speedup over traditional approaches: **10×–100×**
 Performance-critical operations are optimized using several techniques:
 
 * **Numba JIT compilation**
-  Accelerates geometric clipping, area integration, and perimeter extraction loops.
+  Accelerates closed-form disc areas, radius inversion, and perimeter extraction.
 
 * **Precomputed mesh geometry**
 
@@ -92,13 +91,10 @@ Performance-critical operations are optimized using several techniques:
 * **BFS-ordered vertex processing**
 
   * Improves locality
-  * Enables warm-started radius bracketing
-  * Reduces iterations needed for radius inversion
 
-* **Robust radius inversion**
+* **Exact radius inversion**
 
-  * Uses bracketed root-finding for stability
-  * Avoids Newton-method instability on discretized meshes
+  * Uses closed-form face area and its derivative in a bracketed root solver
 
 ---
 
@@ -123,7 +119,9 @@ Automatically restricts computation to cortex label:
 * excludes medial wall
 * reduces computational load
 * matches typical neuroimaging workflows
-* hard-fails if no cortex mask can be resolved (unless `--no-mask` is explicitly set)
+* automatically uses all vertices on `*.cortexonly.*` surfaces
+* hard-fails if no cortex mask can be resolved on other surfaces (unless `--no-mask` is set)
+* rejects label indices outside the mesh instead of silently dropping them
 
 ---
 
@@ -180,11 +178,9 @@ matplotlib
 tqdm
 pycortex
 pygeodesic
-robust-laplacian
-scikit-sparse<0.5
 ```
 
-For best performance, build potpourri3d locally with SuiteSparse. The `batch_heat` backend also needs SuiteSparse/CHOLMOD headers available when installing `scikit-sparse<0.5`; the 0.5+ API requires newer SuiteSparse than many system packages provide.
+For best performance, build potpourri3d locally with SuiteSparse.
 
 ---
 
@@ -203,9 +199,8 @@ Common options:
 --surf-type pial
 --custom-label cortex
 --scale 0.002 0.00267988 ... 0.05
---area-tol 0.01
---engine potpourri|batch_heat|pygeodesic|pycortex
---batch-size 32
+--engine potpourri|potpourri_fmm|pygeodesic|pycortex
+--diffusion-length-mm 0.7
 --n-samples-between-scales 3
 --boundary-cap-fraction 0.05
 --verbose-timing
@@ -234,6 +229,10 @@ The NPZ contains:
 * `sample_indptr`: `int64` row offsets; vertex `v` samples are `flat[indptr[v]:indptr[v+1]]`
 * `sample_scales_solved`, `n_samples_between_scales`, `boundary_cap_fraction`
 * `cortex_mask`, `sub_to_orig`
+* `field_health_flag`: per-vertex flag for corrupted distance fields; flagged metrics are `NaN`
+* `provenance_json`: geometry method and distance-engine settings (schema version 3)
+
+The potpourri engine always uses robust heat-method distances. Its default diffusion length is fixed at 0.7 mm across meshes. Earlier outputs used different distance settings and should be recomputed before comparison. Radii are solved to the area target; `--area-tol`, `--batch-size`, and `--use-robust` remain accepted as deprecated no-ops. The sample archive contains solved scale pairs and up to `11 × n_samples_between_scales` supplementary pairs for the 12-scale pipeline default; it contains no bisection history. The `batch_heat` backend has been removed.
 
 ---
 
@@ -277,13 +276,13 @@ Typical performance on fsaverage6 (~41k vertices):
 
 | Metric                          | Time                          |
 | ------------------------------- | ----------------------------- |
-| Radius + Perimeter + Anisotropy | seconds–minutes              |
+| Radius + Perimeter              | seconds–minutes              |
 | MSD                             | minutes                       |
 | Full hemisphere                 | practical on workstation CPUs |
 
-Performance scales approximately linearly with number of vertices.
+Per-source work scales approximately linearly with mesh size. Computing a full hemisphere requires one source solve per vertex, so total work scales roughly quadratically with the number of vertices.
 
-The radius phase uses vectorized fully-inside triangle accumulation and band-only clipping around isolines. `--n-samples-between-scales` adds a small amount of area-integration work after the scale radii have been solved. `--boundary-cap-fraction` filters only supplementary samples by estimated boundary-clipped disc area loss; converged target-scale samples are always retained. The value is an area-loss fraction under a locally Euclidean, locally planar-boundary circular-segment approximation: `0.0` rejects once a supplementary disc crosses the boundary, `0.05` permits up to 5% loss, and values must be in `[0, 0.5)`. Leave it unset or use `--boundary-cap-fraction none` for no cap. This is not comparable to the old geometric radius-fraction semantics; old values should be reselected explicitly.
+The radius phase evaluates closed-form triangle areas in distance bands and solves each target area directly. `--n-samples-between-scales` adds supplementary area samples after the scale radii have been solved. `--boundary-cap-fraction` filters only supplementary samples by estimated boundary-clipped disc area loss; solved target-scale samples are always retained. The value is an area-loss fraction under a locally Euclidean, locally planar-boundary circular-segment approximation: `0.0` rejects once a supplementary disc crosses the boundary, `0.05` permits up to 5% loss, and values must be in `[0, 0.5)`. Leave it unset or use `--boundary-cap-fraction none` for no cap.
 
 ---
 
